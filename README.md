@@ -50,19 +50,6 @@ These are already included in this repository.
 ## Usage
 
 ```bash
-pixi run dock
-```
-
-Or from inside a pixi shell:
-
-```bash
-pixi shell
-dock
-```
-
-To run a docking job directly without the interactive generator:
-
-```bash
 pixi run python anchored_docking.py \
     --template_file test/crystal_ligand.sdf \
     --input_file test/CAT-13f.sdf \
