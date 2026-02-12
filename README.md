@@ -121,7 +121,14 @@ This loads all three structures with sensible colours and styling, and saves a `
 An interactive generator with tab completion is included:
 
 ```bash
-pixi run python generate_slurm.py
+pixi run dock
+```
+
+Or from inside a pixi shell:
+
+```bash
+pixi shell
+dock
 ```
 
 It walks you through SLURM settings (partition, GPUs, time limit, modules) and all docking parameters, then writes a ready-to-submit script. Tab works for file paths and choice fields.

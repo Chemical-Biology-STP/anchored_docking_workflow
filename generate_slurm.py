@@ -100,6 +100,8 @@ def main():
     # --- Required docking parameters ---
     print("\n-- Docking parameters (required) --")
     template_file = prompt_path("Template ligand SDF (--template_file)")
+    print("\n  This can be a single molecule or a multi-molecule SDF file.")
+    print("  If it contains multiple molecules, each one will be docked separately.")
     input_file = prompt_path("Input ligand SDF (--input_file)")
     receptor_file = prompt_path("Receptor PDB (--receptor_file)")
     docking_dir = prompt_path("Output directory (--docking_dir)", default="output")
