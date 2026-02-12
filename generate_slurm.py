@@ -107,21 +107,51 @@ def main():
     # --- Paths ---
     print("\n-- Tool paths --")
     adg_path = prompt_path("AutoDock-GPU bin dir (--adg_path)", default="$PWD/bin")
-    adfr_path = prompt_path("ADFRsuite dir (--adfr_path)", default="ADFRsuite-1.0")
+    adfr_path = prompt_path("ADFRsuite dir (--adfr_path)", default="/nemo/stp/chemicalbiology/home/shared/software/ADFRsuite")
     scripts_path = prompt_path("Scripts dir (--scripts_path)", default="scripts")
 
     # --- Optional docking parameters ---
-    print("\n-- Optional docking parameters (press Enter to skip) --")
-    anchor_num = prompt_value("Number of anchors (--anchor_num)", default="3", cast=int)
-    anchor_mode = prompt_choice("Anchor mode (--anchor_mode)", ["random", "area"], default="random")
-    box_size = prompt_value("Box size in Angstroms (--size)", default="20.0", cast=float)
-    query_smarts = prompt_value("Query SMARTS (--query_smarts)", default=None)
-    anchor_indices = prompt_value("Anchor indices, space-separated (--anchor_indices)", default=None)
-    samples = prompt_value("Samples for area mode (--samples)", default="100", cast=int)
-    random_seed = prompt_value("Random seed (--random_seed)", default=None)
-    force = prompt_bool("Overwrite output dir (--force)", default=True)
-    clean = prompt_bool("Clean intermediate files (--clean)", default=False)
-    verbose = prompt_bool("Verbose output (--verbose)", default=False)
+    print("\n-- Optional docking parameters (press Enter to keep defaults) --")
+
+    print("\n  Anchors are atoms shared between your template and input molecule")
+    print("  that act like pins to hold the molecule in the right orientation.")
+    anchor_num = prompt_value("How many anchor pins to use", default="3", cast=int)
+
+    print("\n  'random' picks anchor atoms randomly from the shared structure.")
+    print("  'area' picks 3 anchors that are as spread out as possible (like a tripod).")
+    anchor_mode = prompt_choice("Anchor selection strategy", ["random", "area"], default="random")
+
+    print("\n  The search box is the region around the binding site where the")
+    print("  molecule is allowed to move. Larger = more freedom, slower search.")
+    box_size = prompt_value("Search box size in Angstroms", default="20.0", cast=float)
+
+    print("\n  Normally the shared structure between template and input is found")
+    print("  automatically. Set this only if you want to manually define which")
+    print("  part of the molecule to match (advanced, uses SMARTS notation).")
+    query_smarts = prompt_value("Manual substructure pattern (SMARTS)", default=None)
+
+    if query_smarts:
+        print("\n  Since you set a manual SMARTS, you can pick exactly which atoms")
+        print("  in that pattern to use as anchors (0-based atom positions).")
+        anchor_indices = prompt_value("Specific anchor atom positions (space-separated)", default=None)
+    else:
+        anchor_indices = None
+
+    if anchor_mode == "area":
+        print("\n  When using the 'area' strategy, the script tries many random sets")
+        print("  of 3 anchors and keeps the most spread-out set. More samples = better")
+        print("  result but slower.")
+        samples = prompt_value("Number of random attempts for tripod selection", default="100", cast=int)
+    else:
+        samples = 100
+
+    print("\n  Set a seed to get the same anchor selection every time you run.")
+    print("  Leave blank for a different random pick each run.")
+    random_seed = prompt_value("Random seed for reproducibility", default=None)
+
+    force = prompt_bool("Overwrite output directory if it exists", default=True)
+    clean = prompt_bool("Delete intermediate files after docking finishes", default=False)
+    verbose = prompt_bool("Show extra debug info during the run", default=False)
 
     # --- Build the command ---
     cmd_parts = [

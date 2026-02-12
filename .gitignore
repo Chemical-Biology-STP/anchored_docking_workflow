@@ -20,5 +20,8 @@ test/output/
 # Stale symlinks
 adgpu
 
+# Generated SLURM scripts
+submit_dock.sh
+
 # Archives
 scripts/anchored_docking_scripts.zip

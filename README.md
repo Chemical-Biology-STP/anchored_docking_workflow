@@ -104,6 +104,17 @@ pixi run python anchored_docking.py \
 6. Adds Gaussian bias potentials to grid maps at anchor positions
 7. Runs AutoDock-GPU with the biased maps
 8. Exports the docked pose as SDF
+9. Generates a PyMOL script (`view_results.pml`) for visualising the results
+
+## Viewing results
+
+After docking completes, each output subdirectory contains a `view_results.pml` script. Open it in [PyMOL](https://pymol.org/) to see the receptor, template ligand, and docked pose together:
+
+```bash
+pymol test/output/0/view_results.pml
+```
+
+This loads all three structures with sensible colours and styling, and saves a `docking_results.pse` session file you can reopen later without the script.
 
 ## Generating a SLURM submission script
 

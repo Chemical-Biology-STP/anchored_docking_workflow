@@ -315,9 +315,49 @@ def export_results(docking_dir):
         export_cmd = ["mk_export.py", "ligand.dlg", "-o", "ligand_docked.sdf"]
     subprocess.run(export_cmd, cwd=docking_dir, check=True)
 
+def generate_pymol_session(docking_dir, template_file, receptor_file):
+    """Write a PyMOL script that loads the receptor, template, and docked ligand."""
+    template_sdf = os.path.join(docking_dir, "template.sdf")
+    shutil.copy2(template_file, template_sdf)
+
+    pml_content = """\
+# Load structures
+load receptor.pdb, receptor
+load template.sdf, template
+load ligand_docked.sdf, docked_ligand
+
+# Style receptor
+hide everything, receptor
+show cartoon, receptor
+color gray80, receptor
+set cartoon_transparency, 0.5, receptor
+
+# Style template ligand
+show sticks, template
+color cyan, template
+
+# Style docked ligand
+show sticks, docked_ligand
+color magenta, docked_ligand
+
+# General settings
+bg_color white
+set stick_radius, 0.15
+set ray_opaque_background, 1
+zoom docked_ligand, 5
+
+# Save session
+save docking_results.pse
+"""
+    pml_path = os.path.join(docking_dir, "view_results.pml")
+    with open(pml_path, "w") as f:
+        f.write(pml_content)
+
+
 def clean_directory(docking_dir):
+    keep = {"ligand_docked.sdf", "template.sdf", "receptor.pdb", "view_results.pml", "docking_results.pse"}
     for f in os.listdir(docking_dir):
-        if f != "ligand_docked.sdf":
+        if f not in keep:
             os.remove(os.path.join(docking_dir, f))
 
 def main():
@@ -397,9 +437,15 @@ def main():
         # Export results
         export_results(docking_dir)
 
+        # Generate PyMOL session script
+        generate_pymol_session(docking_dir, args.template_file, args.receptor_file)
+
         # Clean up if needed
         if args.clean:
             clean_directory(docking_dir)
+
+    print(f"\nDocking complete. To visualise results, open the PyMOL script:")
+    print(f"  pymol <docking_dir>/<index>/view_results.pml")
 
 if __name__ == "__main__":
     main()
