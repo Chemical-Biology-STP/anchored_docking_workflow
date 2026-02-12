@@ -105,6 +105,16 @@ pixi run python anchored_docking.py \
 7. Runs AutoDock-GPU with the biased maps
 8. Exports the docked pose as SDF
 
+## Generating a SLURM submission script
+
+An interactive generator with tab completion is included:
+
+```bash
+pixi run python generate_slurm.py
+```
+
+It walks you through SLURM settings (partition, GPUs, time limit, modules) and all docking parameters, then writes a ready-to-submit script. Tab works for file paths and choice fields.
+
 ## Example
 
 Using the included Bace1 test case:

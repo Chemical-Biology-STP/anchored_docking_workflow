@@ -17,8 +17,8 @@ test/output/
 # Log files
 *.log
 
-# Empty dirs
-adgpu/
+# Stale symlinks
+adgpu
 
 # Archives
 scripts/anchored_docking_scripts.zip
