@@ -154,3 +154,7 @@ pixi run python anchored_docking.py \
 - Cyan: template ligand (CAT-4j)
 - Magenta: docked CAT-13f
 - Yellow: CAT-13f pose from the [Wang-FEP-dataset](https://github.com/ohuelab/Wang-FEP-dataset)
+
+## Acknowledgements
+
+Refactored and improved by Daniella Hares and Yew Mun Yip from the Chemical Biology STP.
