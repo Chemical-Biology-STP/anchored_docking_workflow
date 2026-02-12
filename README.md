@@ -53,7 +53,14 @@ These are already included in this repository.
 pixi run dock
 ```
 
-Or run directly:
+Or from inside a pixi shell:
+
+```bash
+pixi shell
+dock
+```
+
+To run a docking job directly without the interactive generator:
 
 ```bash
 pixi run python anchored_docking.py \
