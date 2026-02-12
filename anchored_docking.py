@@ -222,7 +222,7 @@ def generate_parameters_json(scripts_path, anchor_patterns, pattern_mol):
         if atype is None:
             raise ValueError(f"Could not determine atom type for atom index {idx}.")
         new_atype = 'A' + base36encode(i, 2)
-        d = {"smarts": smarts, "IDX": [idx + 1], "atype": new_atype}
+        d = {"smarts": smarts, "IDX": [idx], "atype": new_atype}
         parameters['ad4'].append(d)
         anchor_dict_list.append(d)
         new_atype2atype[new_atype] = atype

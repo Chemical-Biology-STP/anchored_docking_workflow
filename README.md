@@ -1,44 +1,128 @@
-# anchored_docking_workflow
+# Anchored Docking Workflow
 
-An automated configuration script for anchored docking using AutoDock-GPU.
+An automated pipeline for anchored docking using AutoDock-GPU. By overlaying ligands that share a common core with a template ligand, this serves as an alternative to core-constrained docking.
 
-**Note:** This project is still under development.
+Based on the [AutoDock-GPU Anchored Docking Guide](https://github.com/ccsb-scripps/AutoDock-GPU/wiki/Anchored-docking).
 
-## Overview
+> **Note:** This project is under active development and has not been experimentally validated.
 
-This script provides a simplified setup for performing anchored docking as described in the [AutoDock-GPU Anchored Docking Guide](https://github.com/ccsb-scripps/AutoDock-GPU/wiki/Anchored-docking). By overlaying ligands that share a core, it functions as an alternative to core-constrained docking.
+## Prerequisites
 
-While this method may be useful for applications like relative binding free energy perturbation calculations, please note that it has not been experimentally validated.
+You need the following installed and accessible on your system:
 
-## Environment Setup
+1. [AutoDock-GPU](https://github.com/ccsb-scripps/AutoDock-GPU/releases/) — the docking engine (`autodock_gpu_128wi` or similar binary)
+2. [AutoGrid4](https://autodock.scripps.edu/download-autodock4/) — for grid map generation
+3. [ADFRsuite](https://ccsb.scripps.edu/adfr/downloads/) — for receptor preparation (`prepare_receptor`)
+4. [Pixi](https://pixi.sh/) — package manager for Python dependencies
 
-The requirements are the same as those listed in the [Anchored Docking Guide](https://github.com/ccsb-scripps/AutoDock-GPU/wiki/Anchored-docking).
+## Installation
 
-   - [RDKit](https://www.rdkit.org/)
-   - [Meeko==0.6.1](https://github.com/forlilab/Meeko)
-   - [ADFR](https://ccsb.scripps.edu/adfr/downloads/)
-   - [AutoDock-GPU](https://github.com/ccsb-scripps/AutoDock-GPU/releases/)
-   - [AutoGrid](https://autodock.scripps.edu/download-autodock4/)
-   - Download and extract `scripts.zip` from the ~~[Anchored Docking Guide](https://github.com/ccsb-scripps/AutoDock-GPU/wiki/Anchored-docking)~~.
-        - Since the above page has been removed, please download `write-gpf.py` from https://github.com/diogomart/write-autogrid-config, and download `addbias.py` and `insert_type_in_fld.py` with reference to https://github.com/ccsb-scripps/AutoDock-GPU/issues/283. Place these files in the `scripts` directory. Note that these download links are temporary and likely to change in the future.
+```bash
+git clone https://github.com/Chemical-Biology-STP/anchored_docking_workflow.git
+cd anchored_docking_workflow
+pixi install
+```
+
+This installs the Python dependencies (RDKit, Meeko 0.6.1) into a local `.pixi` environment.
+
+### Setting up binaries
+
+The script expects paths to AutoDock-GPU and ADFRsuite. You can either:
+
+- Pass them via `--adg_path` and `--adfr_path` flags, or
+- Create symlinks in a `bin/` directory:
+
+```bash
+mkdir -p bin
+ln -s /path/to/autodock_gpu_128wi bin/adgpu
+ln -s /path/to/autogrid4 bin/autogrid4
+```
+
+### Scripts directory
+
+The `scripts/` directory contains helper scripts required by the pipeline:
+
+- `write-gpf.py` — from [diogomart/write-autogrid-config](https://github.com/diogomart/write-autogrid-config)
+- `addbias.py` and `insert_type_in_fld.py` — see [AutoDock-GPU#283](https://github.com/ccsb-scripps/AutoDock-GPU/issues/283)
+
+These are already included in this repository.
 
 ## Usage
 
-As a test case, we provide an anchored docking tutorial for the Bace1 receptor.
+```bash
+pixi run dock
+```
 
-Run the following command:
+Or run directly:
 
 ```bash
-python anchored_docking.py \
+pixi run python anchored_docking.py \
     --template_file test/crystal_ligand.sdf \
     --input_file test/CAT-13f.sdf \
     --receptor_file test/Bace1_protein.pdb \
-    --docking_dir test/output
+    --docking_dir test/output \
+    --adg_path /path/to/autodock-gpu/bin \
+    --adfr_path /path/to/ADFRsuite
+```
+
+## Parameters
+
+### Required
+
+| Parameter | Description |
+|---|---|
+| `--template_file` | SDF file of the reference/crystal ligand used to define anchor positions |
+| `--input_file` | SDF file of the ligand(s) to dock (can contain multiple molecules) |
+| `--receptor_file` | PDB file of the receptor protein |
+| `--docking_dir` | Output directory for docking results |
+
+### Optional
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--anchor_num` | `3` | Number of anchor points to use |
+| `--anchor_mode` | `random` | Anchor selection mode: `random` or `area` (area always uses 3 anchors, maximising triangle area) |
+| `--query_smarts` | `None` | Manually specify a SMARTS pattern for the common substructure instead of using MCS |
+| `--anchor_indices` | `None` | Specify exact anchor atom indices (0-based) within the query SMARTS. Requires `--query_smarts` |
+| `--size` | `20.0` | Size of the docking box in Angstroms |
+| `--samples` | `100` | Number of random samples when using `area` anchor mode |
+| `--random_seed` | `None` | Random seed for reproducible anchor selection |
+| `--adg_path` | `autodock-gpu` | Path to directory containing the AutoDock-GPU binary (`adgpu`) |
+| `--adfr_path` | `ADFRsuite-1.0` | Path to ADFRsuite installation directory |
+| `--scripts_path` | `scripts` | Path to the helper scripts directory |
+| `--force` | `False` | Overwrite the output directory if it already exists |
+| `--clean` | `False` | Remove intermediate files after docking |
+| `--verbose` | `False` | Print additional debug information (SMILES, SMARTS, etc.) |
+
+## How it works
+
+1. Finds the maximum common substructure (MCS) between the template and input ligand (or uses a user-provided SMARTS)
+2. Selects anchor atoms — unique, non-equivalent heavy atoms in the common core
+3. Generates custom atom types for anchor atoms and writes a Meeko parameters file
+4. Prepares the ligand (PDBQT via Meeko) and receptor (PDBQT via ADFR)
+5. Runs AutoGrid to generate grid maps
+6. Adds Gaussian bias potentials to grid maps at anchor positions
+7. Runs AutoDock-GPU with the biased maps
+8. Exports the docked pose as SDF
+
+## Example
+
+Using the included Bace1 test case:
+
+```bash
+pixi run python anchored_docking.py \
+    --template_file test/crystal_ligand.sdf \
+    --input_file test/CAT-13f.sdf \
+    --receptor_file test/Bace1_protein.pdb \
+    --docking_dir test/output \
+    --force \
+    --adg_path $PWD/bin \
+    --adfr_path /path/to/ADFRsuite
 ```
 
 <img src="docked_pose.png" width="60%">
 
-- green: receptor (Bace1)
-- cyan: template ligand (CAT-4j)
-- magenta: docked CAT-13f
-- yellow: CAT-13f Pose used in [Wang-FEP-dataset](https://github.com/ohuelab/Wang-FEP-dataset)
+- Green: receptor (Bace1)
+- Cyan: template ligand (CAT-4j)
+- Magenta: docked CAT-13f
+- Yellow: CAT-13f pose from the [Wang-FEP-dataset](https://github.com/ohuelab/Wang-FEP-dataset)

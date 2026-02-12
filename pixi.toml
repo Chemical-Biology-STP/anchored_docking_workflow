@@ -1,0 +1,13 @@
+[workspace]
+channels = ["conda-forge", "https://conda.anaconda.org/hcc"]
+name = "anchored_docking_workflow"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+dock = "python anchored_docking.py --template_file test/crystal_ligand.sdf --input_file test/CAT-13f.sdf --receptor_file test/Bace1_protein.pdb --docking_dir test/output --force --adg_path $PWD/bin --adfr_path /nemo/stp/chemicalbiology/home/shared/software/ADFRsuite"
+
+[dependencies]
+rdkit = ">=2025.9.5,<2026"
+meeko = "==0.6.1"
+python = ">=3.9"

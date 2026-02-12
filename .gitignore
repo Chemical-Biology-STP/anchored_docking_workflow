@@ -1,0 +1,24 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+
+# Symlinked binaries (site-specific)
+bin/
+
+# Docking output
+test/output/
+
+# Log files
+*.log
+
+# Empty dirs
+adgpu/
+
+# Archives
+scripts/anchored_docking_scripts.zip
