@@ -3,13 +3,19 @@ import shutil
 import json
 import copy
 import argparse
+import hashlib
+import sys
+import traceback
 import numpy as np
 import subprocess
+from typing import NamedTuple
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdFMCS
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO_DIR)
+import pose_check  # noqa: E402
 DEFAULT_ADFR_PATH = os.path.join(REPO_DIR, ".pixi", "envs", "adfr")
 ADGPU_BINARY_NAMES = ("adgpu", "autodock_gpu_128wi", "autodock_gpu_64wi", "autodock_gpu_256wi")
 
@@ -46,6 +52,18 @@ def find_autogrid(adg_path=None):
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     raise FileNotFoundError("autogrid4 not found. Run this script through `pixi run` so the pixi environment is on PATH.")
+
+
+class LigandError(Exception):
+    """A problem with one ligand. It fails that ligand only; the rest of the batch continues."""
+
+
+class AnchorSearch(NamedTuple):
+    anchor_patterns: list      # (SMARTS, atom index in pattern_mol) for each chosen anchor
+    anchor_positions: list     # target coordinates of those anchors, taken from the template
+    pattern_mol: object        # the shared core as a molecule
+    ptn2template: dict         # core atom index -> template atom index
+    pattern_smarts: str        # SMARTS of the shared core
 
 
 def base36encode(number, length=2):
@@ -110,8 +128,13 @@ def parse_arguments():
     parser.add_argument("--random_seed", type=int, default=None, help="Random seed for sampling")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--clean", action="store_true", help="Clean the directory after docking")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue a previous run in --docking_dir: ligands that already have a docked pose are "
+                             "skipped, the others are redone. Inputs and docking settings must be unchanged.")
     args = parser.parse_args()
 
+    if args.resume and args.force:
+        parser.error("--resume keeps the existing results and --force deletes them; use only one.")
     if args.anchor_indices is not None and args.query_smarts is None:
         raise ValueError("Query SMILES must be provided when anchor indices are specified.")
     if args.anchor_indices is not None and args.anchor_num > 0:
@@ -120,7 +143,93 @@ def parse_arguments():
         print("Anchor indices are specified. Anchor mode will be ignored.")
     return args
 
-def prepare_docking_directory(docking_dir, force):
+SETTINGS_FILE = "run_settings.json"
+SUMMARY_FILE = "summary.tsv"
+SUMMARY_COLUMNS = ("index", "name", "status", "anchor_max_dev", "core_rmsd", "note")
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def run_signature(template_file, input_file, receptor_file, anchor_num, anchor_mode, size, samples,
+                  random_seed, query_smarts, anchor_indices):
+    """Everything that decides what a docking run produces, so a resume can refuse to mix runs."""
+    return {
+        "template_sha256": file_digest(template_file),
+        "ligands_sha256": file_digest(input_file),
+        "receptor_sha256": file_digest(receptor_file),
+        "anchor_num": anchor_num,
+        "anchor_mode": anchor_mode,
+        "size": float(size),
+        "samples": samples,
+        "random_seed": random_seed,
+        "query_smarts": query_smarts,
+        "anchor_indices": list(anchor_indices) if anchor_indices else None,
+    }
+
+
+def signature_differences(old, new):
+    """Names of the settings that differ between a previous run and the requested one."""
+    return [key for key in sorted(set(old) | set(new)) if old.get(key) != new.get(key)]
+
+
+def read_run_settings(docking_dir):
+    """Settings of a previous run, or None if the folder has none."""
+    path = os.path.join(docking_dir, SETTINGS_FILE)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def write_summary(docking_dir, rows):
+    """Write summary.tsv (one row per ligand, in order). Replaced atomically so it is never half-written."""
+    path = os.path.join(docking_dir, SUMMARY_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\t".join(SUMMARY_COLUMNS) + "\n")
+        for index in sorted(rows):
+            row = rows[index]
+            fh.write("\t".join(str(row.get(c, "")).replace("\t", " ").replace("\n", " ") for c in SUMMARY_COLUMNS) + "\n")
+    os.replace(tmp, path)
+
+
+def read_summary(docking_dir):
+    """Rows of summary.tsv as a list of dicts (empty if there is none)."""
+    path = os.path.join(docking_dir, SUMMARY_FILE)
+    if not os.path.isfile(path):
+        return []
+    with open(path) as fh:
+        lines = fh.read().splitlines()
+    header = lines[0].split("\t") if lines else []
+    return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
+
+
+def ligand_label(mol, index):
+    if mol is not None and mol.HasProp("_Name") and mol.GetProp("_Name").strip():
+        return mol.GetProp("_Name").strip()
+    return f"molecule {index + 1}"
+
+
+def prepare_docking_directory(docking_dir, force, resume=False, signature=None):
+    if resume:
+        if not os.path.isdir(docking_dir):
+            raise ValueError(f"Nothing to resume: '{docking_dir}' does not exist.")
+        previous = read_run_settings(docking_dir)
+        if previous is None:
+            raise ValueError(f"'{docking_dir}' has no {SETTINGS_FILE}, so it is not a previous run of this "
+                             "workflow. Use a new folder, or --force to overwrite.")
+        if signature is not None:
+            changed = signature_differences(previous, signature)
+            if changed:
+                raise ValueError("Cannot resume: these inputs or settings differ from the previous run: "
+                                 + ", ".join(changed) + ". Use a new folder, or --force to start again.")
+        return
     if force:
         if os.path.exists(docking_dir):
             shutil.rmtree(docking_dir)
@@ -243,7 +352,7 @@ def find_anchor_points(template_mol, input_mol, anchor_num, samples, random_seed
         else:
             anchor_patterns = anchor_patterns_all
             anchor_positions = anchor_positions_all
-    return anchor_patterns, anchor_positions, pattern_mol
+    return AnchorSearch(anchor_patterns, anchor_positions, pattern_mol, ptn2template_mapping, pattern_smarts)
 
 
 def generate_parameters_json(scripts_path, anchor_patterns, pattern_mol):
@@ -267,9 +376,32 @@ def generate_parameters_json(scripts_path, anchor_patterns, pattern_mol):
         new_atype2atype[new_atype] = atype
     return parameters, anchor_dict_list, new_atype2atype
 
+# Each embedding attempt is cut off after this long. Ordinary ligands take well under a second;
+# a hopeless one (measured: a strained cage) otherwise needs about a minute to give up.
+EMBED_TIMEOUT_SECONDS = 30
+
+
+def embed_ligand(input_mol, timeout=EMBED_TIMEOUT_SECONDS):
+    """Add hydrogens and generate 3D coordinates.
+
+    RDKit signals a failed embedding only through its return value, and leaves the molecule
+    without any coordinates; writing it out then produces a flat 2D layout that Meeko accepts.
+    Raise instead, so such a ligand is reported and not docked with a wrong geometry.
+    """
+    mol_h = Chem.AddHs(input_mol, addCoords=True)
+    params = AllChem.ETKDGv3()
+    params.timeout = timeout
+    if AllChem.EmbedMolecule(mol_h, params) != 0:
+        retry = AllChem.ETKDGv3()
+        retry.timeout = timeout
+        retry.useRandomCoords = True  # RDKit's usual fallback for hard-to-embed molecules
+        if AllChem.EmbedMolecule(mol_h, retry) != 0:
+            raise LigandError("RDKit could not generate 3D coordinates for this ligand "
+                              "(strained or impossible geometry or stereochemistry)")
+    return mol_h
+
 def prepare_ligand(docking_dir, input_mol):
-    inputmol_h = Chem.AddHs(input_mol, addCoords=True)
-    AllChem.EmbedMolecule(inputmol_h, AllChem.ETKDGv3())
+    inputmol_h = embed_ligand(input_mol)
     ligand_sdf = os.path.join(docking_dir, "ligand.sdf")
     with Chem.SDWriter(ligand_sdf) as f:
         f.write(inputmol_h)
@@ -391,7 +523,8 @@ save docking_results.pse
 
 
 def clean_directory(docking_dir):
-    keep = {"ligand_docked.sdf", "template.sdf", "receptor.pdb", "view_results.pml", "docking_results.pse"}
+    keep = {"ligand_docked.sdf", "template.sdf", "receptor.pdb", "view_results.pml", "docking_results.pse",
+            "pose_check.json", "anchor_positions.json"}
     for f in os.listdir(docking_dir):
         if f not in keep:
             os.remove(os.path.join(docking_dir, f))
@@ -405,8 +538,15 @@ def main():
     adgpu_bin = find_autodock_gpu(adg_path)
     autogrid_bin = find_autogrid(adg_path)
 
+    signature = run_signature(args.template_file, args.input_file, args.receptor_file, args.anchor_num,
+                              args.anchor_mode, args.size, args.samples, args.random_seed,
+                              args.query_smarts, args.anchor_indices)
+
     # Prepare docking directory
-    prepare_docking_directory(args.docking_dir, args.force)
+    prepare_docking_directory(args.docking_dir, args.force, args.resume, signature)
+    if not args.resume:
+        with open(os.path.join(args.docking_dir, SETTINGS_FILE), "w") as f:
+            json.dump(signature, f, indent=4)
 
     # Load molecules
     template_mol = Chem.SDMolSupplier(args.template_file)[0]
@@ -414,76 +554,177 @@ def main():
     if template_mol is None or input_mols is None:
         raise ValueError("Failed to load molecule files.")
 
+    tools = {"adfr_path": adfr_path, "scripts_path": scripts_path, "adgpu_bin": adgpu_bin,
+             "autogrid_bin": autogrid_bin}
+    rows = {}
+    total = len(input_mols)
     for index, input_mol in enumerate(input_mols):
+        name = ligand_label(input_mol, index)
         docking_dir = os.path.join(args.docking_dir, str(index))
+        pose_path = os.path.join(docking_dir, "ligand_docked.sdf")
+
+        if args.resume and os.path.isfile(pose_path):
+            rows[index] = previous_row(index, name, docking_dir)
+            print(f"[{index + 1}/{total}] {name}: already docked, skipped", flush=True)
+            write_summary(args.docking_dir, rows)
+            continue
+
+        if os.path.isdir(docking_dir):  # left over from an interrupted or failed attempt
+            shutil.rmtree(docking_dir)
         os.makedirs(docking_dir)
+        try:
+            if input_mol is None:
+                raise LigandError("RDKit could not read this molecule from the input file")
+            checked = dock_ligand(args, tools, template_mol, input_mol, docking_dir)
+        except Exception as exc:  # one ligand must not stop the others
+            note = describe_failure(exc)
+            with open(os.path.join(docking_dir, "error.txt"), "w") as f:
+                f.write(f"{note}\n\n{traceback.format_exc()}")
+            rows[index] = {"index": index, "name": name, "status": "failed", "note": note}
+            print(f"[{index + 1}/{total}] {name}: FAILED - {note}", flush=True)
+        else:
+            rows[index] = row_from_check(index, name, checked)
+            print(f"[{index + 1}/{total}] {name}: {describe_row(rows[index])}", flush=True)
+            if args.clean:
+                clean_directory(docking_dir)
+        write_summary(args.docking_dir, rows)
 
-        # Calculate center of mass for the grid center
-        center_of_mass = calculate_center_of_mass(template_mol)
-
-        # Prepare boxsize.txt
-        prepare_boxsize_file(docking_dir, args.size, center_of_mass)
-
-        # Find anchor points
-        anchor_patterns, anchor_positions, pattern_mol = find_anchor_points(
-            template_mol,
-            input_mol,
-            args.anchor_num,
-            args.samples,
-            args.random_seed,
-            args.query_smarts,
-            args.anchor_indices,
-            args.anchor_mode,
-            args.verbose,
-        )
-        with open(os.path.join(docking_dir, "anchor_positions.json"), "w") as f:
-            json.dump(anchor_positions, f, indent=4)
+    failed = [r for r in rows.values() if r["status"] == "failed"]
+    flagged = [r for r in rows.values() if r["status"] == "flagged"]
+    docked = [r for r in rows.values() if r["status"] in ("docked", "flagged")]
+    print(f"\nFinished: {len(docked)} of {total} ligand(s) docked, {len(failed)} failed, "
+          f"{len(flagged)} pose(s) flagged for checking.")
+    if flagged:
+        print("Flagged poses did not satisfy the anchoring; look at them before trusting them "
+              f"(see {SUMMARY_FILE}).")
+    for r in failed:
+        print(f"  ligand {r['index']} ({r['name']}): {r['note']}")
+    if failed:
+        print(f"Details are in <docking_dir>/<index>/error.txt. Fix the cause and run again with --resume "
+              "to redo only the failed ligands.")
+    print("To visualise a result, open its PyMOL script: pymol <docking_dir>/<index>/view_results.pml")
+    if failed:
+        sys.exit(1)
 
 
-        # Generate parameters.json
-        parameters, anchor_dict_list, new_atype2atype = generate_parameters_json(
-            scripts_path,
-            anchor_patterns,
-            pattern_mol,
-        )
+def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
+    """Run the whole workflow for one ligand. Returns the pose check result."""
+    # Calculate center of mass for the grid center
+    center_of_mass = calculate_center_of_mass(template_mol)
 
-        # Save parameters.json
-        with open(os.path.join(docking_dir, "parameters.json"), "w") as f:
-            json.dump(parameters, f, indent=4)
+    # Prepare boxsize.txt
+    prepare_boxsize_file(docking_dir, args.size, center_of_mass)
 
-        # Prepare ligand.pdbqt
-        prepare_ligand(docking_dir, input_mol)
+    # Find anchor points
+    search = find_anchor_points(
+        template_mol,
+        input_mol,
+        args.anchor_num,
+        args.samples,
+        args.random_seed,
+        args.query_smarts,
+        args.anchor_indices,
+        args.anchor_mode,
+        args.verbose,
+    )
+    with open(os.path.join(docking_dir, "anchor_positions.json"), "w") as f:
+        json.dump(search.anchor_positions, f, indent=4)
 
-        # Prepare receptor.pdbqt
-        prepare_receptor(docking_dir, args.receptor_file, adfr_path)
+    # Generate parameters.json
+    parameters, anchor_dict_list, new_atype2atype = generate_parameters_json(
+        tools["scripts_path"],
+        search.anchor_patterns,
+        search.pattern_mol,
+    )
 
-        # Prepare grid
-        prepare_grid(docking_dir, scripts_path, autogrid_bin)
+    # Save parameters.json
+    with open(os.path.join(docking_dir, "parameters.json"), "w") as f:
+        json.dump(parameters, f, indent=4)
 
-        # Add bias to the map file
-        add_bias_to_map_file(
-            docking_dir,
-            scripts_path,
-            anchor_dict_list,
-            anchor_positions,
-            new_atype2atype,
-        )
+    # Prepare ligand.pdbqt
+    prepare_ligand(docking_dir, input_mol)
 
-        # Run docking
-        run_docking(docking_dir, adgpu_bin, anchor_dict_list, new_atype2atype)
+    # Prepare receptor.pdbqt
+    prepare_receptor(docking_dir, args.receptor_file, tools["adfr_path"])
 
-        # Export results
-        export_results(docking_dir)
+    # Prepare grid
+    prepare_grid(docking_dir, tools["scripts_path"], tools["autogrid_bin"])
 
-        # Generate PyMOL session script
-        generate_pymol_session(docking_dir, args.template_file, args.receptor_file)
+    # Add bias to the map file
+    add_bias_to_map_file(
+        docking_dir,
+        tools["scripts_path"],
+        anchor_dict_list,
+        search.anchor_positions,
+        new_atype2atype,
+    )
 
-        # Clean up if needed
-        if args.clean:
-            clean_directory(docking_dir)
+    # Run docking
+    run_docking(docking_dir, tools["adgpu_bin"], anchor_dict_list, new_atype2atype)
 
-    print(f"\nDocking complete. To visualise results, open the PyMOL script:")
-    print(f"  pymol <docking_dir>/<index>/view_results.pml")
+    # Export results
+    export_results(docking_dir)
+
+    # Generate PyMOL session script
+    generate_pymol_session(docking_dir, args.template_file, args.receptor_file)
+
+    # Check the pose against the anchoring
+    return check_docked_pose(docking_dir, template_mol, search)
+
+
+def check_docked_pose(docking_dir, template_mol, search):
+    """Measure how well the top pose satisfies the anchoring and save it as pose_check.json."""
+    try:
+        checked = pose_check.check_docked_file(
+            os.path.join(docking_dir, "ligand_docked.sdf"), template_mol, search.pattern_mol,
+            search.pattern_smarts, search.ptn2template, [idx for _, idx in search.anchor_patterns],
+            search.anchor_positions)
+    except Exception as exc:  # a failed check must not discard a finished docking
+        checked = {"ok": None, "problems": [f"the pose check could not be run ({type(exc).__name__}: {exc})"],
+                   "anchor_max": None, "core_rmsd": None, "anchor_deviations": [], "core_atoms": 0}
+    checked["anchor_tolerance"] = pose_check.ANCHOR_TOLERANCE
+    checked["core_rmsd_tolerance"] = pose_check.CORE_RMSD_TOLERANCE
+    with open(os.path.join(docking_dir, "pose_check.json"), "w") as f:
+        json.dump(checked, f, indent=4)
+    return checked
+
+
+def row_from_check(index, name, checked):
+    status = "flagged" if checked.get("ok") is False else "docked"
+    return {"index": index, "name": name, "status": status,
+            "anchor_max_dev": "" if checked.get("anchor_max") is None else checked["anchor_max"],
+            "core_rmsd": "" if checked.get("core_rmsd") is None else checked["core_rmsd"],
+            "note": "; ".join(checked.get("problems", []))}
+
+
+def previous_row(index, name, docking_dir):
+    """Summary row for a ligand docked in an earlier run, from the pose check saved then."""
+    path = os.path.join(docking_dir, "pose_check.json")
+    if os.path.isfile(path):
+        with open(path) as f:
+            return row_from_check(index, name, json.load(f))
+    return {"index": index, "name": name, "status": "docked", "note": "pose was not checked"}
+
+
+def describe_row(row):
+    if row["status"] == "flagged":
+        return f"docked, but flagged: {row['note']}"
+    text = "docked"
+    if row.get("anchor_max_dev") not in ("", None):
+        text += f" (anchor deviation {row['anchor_max_dev']} A, core RMSD {row.get('core_rmsd', '')} A)"
+    elif row.get("note"):
+        text += f" ({row['note']})"
+    return text
+
+
+def describe_failure(exc):
+    """One line saying what went wrong for a ligand."""
+    if isinstance(exc, subprocess.CalledProcessError):
+        program = os.path.basename(exc.cmd[0]) if isinstance(exc.cmd, (list, tuple)) and exc.cmd else str(exc.cmd)
+        return f"{program} failed (exit code {exc.returncode})"
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return text if isinstance(exc, LigandError) else f"{type(exc).__name__}: {text}"[:300]
+
 
 if __name__ == "__main__":
     main()

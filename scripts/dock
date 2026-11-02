@@ -5,4 +5,4 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-runpy.run_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "generate_slurm.py"), run_name="__main__")
+runpy.run_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dock_cli.py"), run_name="__main__")

@@ -5,7 +5,7 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
-dock = "python generate_slurm.py"
+dock = "python dock_cli.py"
 
 [activation.env]
 PATH = "$CONDA_PREFIX/bin:$PWD/scripts:$PATH"
@@ -22,5 +22,13 @@ autogrid = ">=4.2.9,<5"
 [feature.adfr.dependencies]
 adfr-suite = ">=1.0,<2"
 
+# Tests for the interactive CLI: `pixi run -e dev test`
+[feature.dev.dependencies]
+pytest = ">=8"
+
+[feature.dev.tasks]
+test = "pytest test -q"
+
 [environments]
 adfr = { features = ["adfr"], no-default-feature = true }
+dev = { features = ["dev"] }

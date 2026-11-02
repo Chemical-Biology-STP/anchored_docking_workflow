@@ -21,7 +21,10 @@ test/output/
 adgpu
 
 # Generated SLURM scripts
-submit_dock.sh
+submit_*.sh
+# Python / pytest caches
+__pycache__/
+.pytest_cache/
 
 # Archives
 scripts/anchored_docking_scripts.zip
