@@ -11,6 +11,16 @@ dock = "python generate_slurm.py"
 PATH = "$CONDA_PREFIX/bin:$PWD/scripts:$PATH"
 
 [dependencies]
-rdkit = ">=2025.9.5,<2026"
-meeko = "==0.6.1"
+rdkit = ">=2026.9.1,<2027"
+meeko = ">=0.8.0,<0.9"
 python = ">=3.9"
+autogrid = ">=4.2.9,<5"
+
+# ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python`
+# in the environment's bin/, so it lives in a separate environment.
+# Install it with `pixi install --all`.
+[feature.adfr.dependencies]
+adfr-suite = ">=1.0,<2"
+
+[environments]
+adfr = { features = ["adfr"], no-default-feature = true }

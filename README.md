@@ -8,35 +8,39 @@ Based on the [AutoDock-GPU Anchored Docking Guide](https://github.com/ccsb-scrip
 
 ## Prerequisites
 
-You need the following installed and accessible on your system:
+1. [Pixi](https://pixi.sh/) (0.83.0 or newer) — installs RDKit, Meeko, AutoGrid and ADFRsuite
+2. [AutoDock-GPU](https://github.com/ccsb-scripps/AutoDock-GPU/releases/) — the docking engine. On the Crick HPC it is provided as a module and must be used together with GCC 13.2:
 
-1. [AutoDock-GPU](https://github.com/ccsb-scripps/AutoDock-GPU/releases/) — the docking engine (`autodock_gpu_128wi` or similar binary)
-2. [AutoGrid4](https://autodock.scripps.edu/download-autodock4/) — for grid map generation
-3. [ADFRsuite](https://ccsb.scripps.edu/adfr/downloads/) — for receptor preparation (`prepare_receptor`)
-4. [Pixi](https://pixi.sh/) — package manager for Python dependencies
+   ```bash
+   module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA
+   ```
+
+   Docking needs a GPU, e.g. `--partition=ga100 --gres=gpu:1`.
 
 ## Installation
 
 ```bash
 git clone https://github.com/Chemical-Biology-STP/anchored_docking_workflow.git
 cd anchored_docking_workflow
-pixi install
+pixi install --all
 ```
 
-This installs the Python dependencies (RDKit, Meeko 0.6.1) into a local `.pixi` environment.
+This creates two local `.pixi` environments:
 
-### Setting up binaries
+| Environment | Contents |
+|---|---|
+| `default` | Python 3.12, RDKit 2026.09, Meeko 0.8, AutoGrid 4.2.9 |
+| `adfr` | ADFRsuite 1.0 (`prepare_receptor`) |
 
-The script expects paths to AutoDock-GPU and ADFRsuite. You can either:
+ADFRsuite is in its own environment because its conda package bundles Python 2.7 and would otherwise overwrite `python` in the default environment.
 
-- Pass them via `--adg_path` and `--adfr_path` flags, or
-- Create symlinks in a `bin/` directory:
+### Tool locations
 
-```bash
-mkdir -p bin
-ln -s /path/to/autodock_gpu_128wi bin/adgpu
-ln -s /path/to/autogrid4 bin/autogrid4
-```
+Nothing needs to be configured by hand:
+
+- `autogrid4` is taken from the pixi `default` environment.
+- `prepare_receptor` is taken from `.pixi/envs/adfr` (override with `--adfr_path`).
+- The AutoDock-GPU binary (`adgpu` or `autodock_gpu_*wi`) is found on `PATH` after loading the module (override with `--adg_path <dir>`).
 
 ### Scripts directory
 
@@ -49,14 +53,16 @@ These are already included in this repository.
 
 ## Usage
 
+Run on a GPU node (interactively or via `sbatch`, see below):
+
 ```bash
+module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA
+
 pixi run python anchored_docking.py \
     --template_file test/crystal_ligand.sdf \
     --input_file test/CAT-13f.sdf \
     --receptor_file test/Bace1_protein.pdb \
-    --docking_dir test/output \
-    --adg_path /path/to/autodock-gpu/bin \
-    --adfr_path /path/to/ADFRsuite
+    --docking_dir test/output
 ```
 
 ## Parameters
@@ -81,8 +87,8 @@ pixi run python anchored_docking.py \
 | `--size` | `20.0` | Size of the docking box in Angstroms |
 | `--samples` | `100` | Number of random samples when using `area` anchor mode |
 | `--random_seed` | `None` | Random seed for reproducible anchor selection |
-| `--adg_path` | `autodock-gpu` | Path to directory containing the AutoDock-GPU binary (`adgpu`) |
-| `--adfr_path` | `ADFRsuite-1.0` | Path to ADFRsuite installation directory |
+| `--adg_path` | search `PATH` | Directory containing the AutoDock-GPU binary (`adgpu` or `autodock_gpu_*wi`) |
+| `--adfr_path` | `.pixi/envs/adfr` | ADFRsuite installation directory |
 | `--scripts_path` | `scripts` | Path to the helper scripts directory |
 | `--force` | `False` | Overwrite the output directory if it already exists |
 | `--clean` | `False` | Remove intermediate files after docking |
@@ -125,21 +131,21 @@ pixi shell
 dock
 ```
 
-It walks you through SLURM settings (partition, GPUs, time limit, modules) and all docking parameters, then writes a ready-to-submit script. Tab works for file paths and choice fields.
+It walks you through SLURM settings (partition, GPUs, time limit, modules) and all docking parameters, then writes a ready-to-submit script. Tab works for file paths and choice fields. The defaults are partition `ga100`, modules `GCC/13.2.0` and `AutoDock-GPU/1.5.3-CUDA`, and `~/.local/bin` added to `PATH` so `pixi` is found.
 
 ## Example
 
 Using the included Bace1 test case:
 
 ```bash
+module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA
+
 pixi run python anchored_docking.py \
     --template_file test/crystal_ligand.sdf \
     --input_file test/CAT-13f.sdf \
     --receptor_file test/Bace1_protein.pdb \
     --docking_dir test/output \
-    --force \
-    --adg_path $PWD/bin \
-    --adfr_path /path/to/ADFRsuite
+    --force
 ```
 
 <img src="docked_pose.png" width="60%">

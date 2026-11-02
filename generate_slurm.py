@@ -94,8 +94,9 @@ def main():
     time_limit = prompt_value("Time limit (e.g. 2:00:00)", default=None)
     modules = prompt_value(
         "Modules to load (comma-separated)",
-        default="pixi/0.56.0,AutoDock-GPU/1.5.3-CUDA",
+        default="GCC/13.2.0,AutoDock-GPU/1.5.3-CUDA",
     )
+    pixi_bin_dir = prompt_value("Directory containing the pixi binary", default="$HOME/.local/bin")
 
     # --- Required docking parameters ---
     print("\n-- Docking parameters (required) --")
@@ -108,8 +109,10 @@ def main():
 
     # --- Paths ---
     print("\n-- Tool paths --")
-    adg_path = prompt_path("AutoDock-GPU bin dir (--adg_path)", default="$PWD/bin")
-    adfr_path = prompt_path("ADFRsuite dir (--adfr_path)", default="/nemo/stp/chemicalbiology/home/shared/software/ADFRsuite")
+    print("  AutoGrid and ADFRsuite come from the pixi environments; AutoDock-GPU comes")
+    print("  from the loaded module. Leave these blank unless you need to override them.")
+    adg_path = prompt_path("AutoDock-GPU bin dir (--adg_path)", default=None)
+    adfr_path = prompt_path("ADFRsuite dir (--adfr_path)", default=None)
     scripts_path = prompt_path("Scripts dir (--scripts_path)", default="scripts")
 
     # --- Optional docking parameters ---
@@ -162,14 +165,16 @@ def main():
         f"    --input_file {input_file}",
         f"    --receptor_file {receptor_file}",
         f"    --docking_dir {docking_dir}",
-        f"    --adg_path {adg_path}",
-        f"    --adfr_path {adfr_path}",
         f"    --scripts_path {scripts_path}",
         f"    --anchor_num {anchor_num}",
         f"    --anchor_mode {anchor_mode}",
         f"    --size {box_size}",
         f"    --samples {samples}",
     ]
+    if adg_path:
+        cmd_parts.append(f"    --adg_path {adg_path}")
+    if adfr_path:
+        cmd_parts.append(f"    --adfr_path {adfr_path}")
     if query_smarts:
         cmd_parts.append(f"    --query_smarts '{query_smarts}'")
     if anchor_indices:
@@ -200,6 +205,8 @@ def main():
         mod = mod.strip()
         if mod:
             lines.append(f"module load {mod}")
+    lines.append("")
+    lines.append(f'export PATH="{pixi_bin_dir}:$PATH"')
     lines.append("")
     lines.append(dock_cmd)
     lines.append("")

@@ -8,8 +8,45 @@ import subprocess
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem import rdFMCS
-import meeko
-meeko_version = meeko.__version__
+
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ADFR_PATH = os.path.join(REPO_DIR, ".pixi", "envs", "adfr")
+ADGPU_BINARY_NAMES = ("adgpu", "autodock_gpu_128wi", "autodock_gpu_64wi", "autodock_gpu_256wi")
+
+
+def find_autodock_gpu(adg_path=None):
+    """Locate the AutoDock-GPU binary.
+
+    If adg_path is given, look there; otherwise search PATH (e.g. after
+    `module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA`).
+    """
+    for name in ADGPU_BINARY_NAMES:
+        if adg_path:
+            candidate = os.path.join(adg_path, name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        else:
+            found = shutil.which(name)
+            if found:
+                return found
+    where = adg_path if adg_path else "PATH"
+    raise FileNotFoundError(
+        f"AutoDock-GPU binary not found in {where} (tried: {', '.join(ADGPU_BINARY_NAMES)}). "
+        "On the HPC run: module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA"
+    )
+
+
+def find_autogrid(adg_path=None):
+    """Locate autogrid4: the pixi environment first, then adg_path as a fallback."""
+    found = shutil.which("autogrid4")
+    if found:
+        return found
+    if adg_path:
+        candidate = os.path.join(adg_path, "autogrid4")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise FileNotFoundError("autogrid4 not found. Run this script through `pixi run` so the pixi environment is on PATH.")
+
 
 def base36encode(number, length=2):
     chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -64,8 +101,10 @@ def parse_arguments():
     parser.add_argument("--anchor_mode", choices=["random", "area"], default="random", help="Anchor point selection mode. the number of anchor of area mode is always 3.")
     parser.add_argument("--size", type=float, help="Size of docking box", default=20.0)
     parser.add_argument("--force", action="store_true", help="Force to overwrite the directory")
-    parser.add_argument("--adg_path", default="autodock-gpu")
-    parser.add_argument("--adfr_path", default="ADFRsuite-1.0")
+    parser.add_argument("--adg_path", default=None,
+                        help="Directory containing the AutoDock-GPU binary. Default: search PATH (use `module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA`).")
+    parser.add_argument("--adfr_path", default=DEFAULT_ADFR_PATH,
+                        help="ADFRsuite installation directory. Default: the 'adfr' pixi environment.")
     parser.add_argument("--scripts_path", default="scripts")
     parser.add_argument("--samples", type=int, default=100, help="Number of samples")
     parser.add_argument("--random_seed", type=int, default=None, help="Random seed for sampling")
@@ -252,7 +291,7 @@ def prepare_receptor(docking_dir, receptor_file, adfr_path):
     ]
     subprocess.run(prepare_receptor_cmd, cwd=docking_dir, check=True)
 
-def prepare_grid(docking_dir, scripts_path, adg_path):
+def prepare_grid(docking_dir, scripts_path, autogrid_bin):
     write_gpf_cmd = [
         os.path.join(scripts_path, "write-gpf.py"),
         "receptor.pdbqt",
@@ -262,7 +301,7 @@ def prepare_grid(docking_dir, scripts_path, adg_path):
         "rec",
     ]
     subprocess.run(write_gpf_cmd, cwd=docking_dir, check=True)
-    autogrid_cmd = [os.path.join(adg_path, "autogrid4"), "-p", "rec.gpf", "-l", "rec.glg"]
+    autogrid_cmd = [autogrid_bin, "-p", "rec.gpf", "-l", "rec.glg"]
     subprocess.run(autogrid_cmd, cwd=docking_dir, check=True)
 
 def add_bias_to_map_file(docking_dir, scripts_path, anchor_dict_list, anchor_positions, new_atype2atype):
@@ -289,7 +328,7 @@ def add_bias_to_map_file(docking_dir, scripts_path, anchor_dict_list, anchor_pos
         ]
         subprocess.run(insert_type_cmd, cwd=docking_dir, check=True)
 
-def run_docking(docking_dir, adg_path, anchor_dict_list, new_atype2atype):
+def run_docking(docking_dir, adgpu_bin, anchor_dict_list, new_atype2atype):
     t_options_map = {}
     for anchor_d in anchor_dict_list:
         atype = anchor_d["atype"]
@@ -298,7 +337,7 @@ def run_docking(docking_dir, adg_path, anchor_dict_list, new_atype2atype):
     t_options = "/".join([f"{','.join(v)}={k}" for k, v in t_options_map.items()])
 
     adgpu_cmd = [
-        os.path.join(adg_path, "adgpu"),
+        adgpu_bin,
         "-L",
         "ligand.pdbqt",
         "-M",
@@ -309,10 +348,7 @@ def run_docking(docking_dir, adg_path, anchor_dict_list, new_atype2atype):
     subprocess.run(adgpu_cmd, cwd=docking_dir, check=True)
 
 def export_results(docking_dir):
-    if meeko_version and meeko_version >= "0.6.0":
-        export_cmd = ["mk_export.py", "ligand.dlg", "-s", "ligand_docked.sdf"]
-    else:
-        export_cmd = ["mk_export.py", "ligand.dlg", "-o", "ligand_docked.sdf"]
+    export_cmd = ["mk_export.py", "ligand.dlg", "-s", "ligand_docked.sdf"]
     subprocess.run(export_cmd, cwd=docking_dir, check=True)
 
 def generate_pymol_session(docking_dir, template_file, receptor_file):
@@ -363,9 +399,11 @@ def clean_directory(docking_dir):
 def main():
     args = parse_arguments()
 
-    adg_path = os.path.abspath(args.adg_path)
+    adg_path = os.path.abspath(args.adg_path) if args.adg_path else None
     adfr_path = os.path.abspath(args.adfr_path)
     scripts_path = os.path.abspath(args.scripts_path)
+    adgpu_bin = find_autodock_gpu(adg_path)
+    autogrid_bin = find_autogrid(adg_path)
 
     # Prepare docking directory
     prepare_docking_directory(args.docking_dir, args.force)
@@ -420,7 +458,7 @@ def main():
         prepare_receptor(docking_dir, args.receptor_file, adfr_path)
 
         # Prepare grid
-        prepare_grid(docking_dir, scripts_path, adg_path)
+        prepare_grid(docking_dir, scripts_path, autogrid_bin)
 
         # Add bias to the map file
         add_bias_to_map_file(
@@ -432,7 +470,7 @@ def main():
         )
 
         # Run docking
-        run_docking(docking_dir, adg_path, anchor_dict_list, new_atype2atype)
+        run_docking(docking_dir, adgpu_bin, anchor_dict_list, new_atype2atype)
 
         # Export results
         export_results(docking_dir)
