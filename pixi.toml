@@ -15,6 +15,11 @@ rdkit = ">=2026.9.1,<2027"
 meeko = ">=0.8.0,<0.9"
 python = ">=3.9"
 autogrid = ">=4.2.9,<5"
+gemmi = ">=0.7.5,<0.8"
+numpy = ">=2.5.4,<3"
+scipy = ">=1.18.1,<2"
+pdb2pqr = ">=3.8.0,<4"
+propka = ">=3.5.1,<4"
 
 # ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python`
 # in the environment's bin/, so it lives in a separate environment.
