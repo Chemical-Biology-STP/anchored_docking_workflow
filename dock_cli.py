@@ -372,19 +372,25 @@ def analyse_receptor(path):
     return info
 
 
-def report_receptor(info):
-    """Print findings. Returns False if the file is unusable."""
+def report_receptor(info, hydrogens_fixable=False, check_hetero=True):
+    """Print findings. Returns False if the file is unusable.
+
+    hydrogens_fixable: the wizard offers to add missing hydrogens, so only say they are missing.
+    check_hetero: False for a receptor the wizard cleaned itself, where leftover molecules were chosen.
+    """
     if info["atoms"] == 0:
         fail("No protein atoms (ATOM records) were found. Is this a PDB file?")
         return False
     chains = ", ".join(sorted(c.strip() or "-" for c in info["chains"]))
     ok(f"Protein with {info['atoms'] - info['hydrogens']} heavy atoms (chains: {chains}).")
-    if info["hydrogens"] == 0:
+    if info["hydrogens"] == 0 and hydrogens_fixable:
+        warn("The receptor has no hydrogen atoms.", record=False)
+    elif info["hydrogens"] == 0:
         warn("The receptor has NO hydrogen atoms. They are not added automatically, so the "
              "results will be poor. Add them first (e.g. `h_add` in PyMOL) and save a new PDB.")
     else:
         ok(f"Hydrogens present ({info['hydrogens']}).")
-    if info["hetero"]:
+    if info["hetero"] and check_hetero:
         names = ", ".join(sorted(info["hetnames"]))
         warn(f"The file also contains non-protein molecules ({names}). Waters are removed "
              "automatically, but leftovers such as the original ligand can interfere. "
@@ -613,6 +619,12 @@ class Settings:
     modules: str = DEFAULT_MODULES
     pixi_dir: str = ""
     ligands_used: str = ""
+    add_hydrogens: bool = False
+    protonated: object = None   # protein_prep.ProteinPrep when the wizard protonated the receptor
+    original_receptor: str = ""  # the user's own receptor file, before protonation (separate-files route)
+    template_view: str = ""     # the template with hydrogens, for display only (complex route)
+    prepared: object = None     # structure_prep.Prepared when the receptor and template come from a complex
+    structure_path: str = ""
     resume: bool = False
     remaining: int = 0          # ligands the job will actually dock (fewer than len(kept) when resuming)
     script_path: str = ""
@@ -637,8 +649,11 @@ def build_args(s):
         args += ["--anchor_indices"] + [str(i) for i in s.anchor_indices]
     if s.seed is not None:
         args += ["--random_seed", str(s.seed)]
+    if s.prepared is not None:
+        # A template taken from a structure file has no bond orders, so RDKit must not guess its hydrogens.
+        args += ["--template_view_file", s.template_view or prepared_paths(s)[2]]
     for flag, on in (("--force", s.force and not s.resume), ("--resume", s.resume),
-                     ("--clean", s.clean), ("--verbose", s.verbose)):
+                     ("--add_hydrogens", s.add_hydrogens), ("--clean", s.clean), ("--verbose", s.verbose)):
         if on:
             args.append(flag)
     return args
@@ -689,6 +704,40 @@ def prepare_ligand_file(s):
     write_ligands(s.ligands_used, s.kept)
 
 
+def prepared_paths(s):
+    """Where the cleaned receptor, the extracted template and its display version are saved for the job."""
+    return (os.path.join(jobdir(s), f"{s.jobname}_receptor.pdb"),
+            os.path.join(jobdir(s), f"{s.jobname}_template.sdf"),
+            os.path.join(jobdir(s), f"{s.jobname}_template_with_hydrogens.sdf"))
+
+
+def finalize_structure_files(s):
+    """Save the cleaned receptor and template next to the results and point the job at them.
+
+    Until now they lived in a temporary folder that disappears when the assistant exits; the job
+    (and a later resume) needs files that stay.
+    """
+    if s.prepared is None and s.protonated is None:
+        return
+    os.makedirs(jobdir(s), exist_ok=True)
+    receptor, template, template_view = prepared_paths(s)
+    if s.prepared is not None:
+        with open(receptor, "w") as fh:
+            fh.write(s.prepared.receptor_pdb)       # already the protonated text if the wizard protonated it
+        with open(template, "w") as fh:
+            fh.write(s.prepared.template_molblock)
+        with open(template_view, "w") as fh:  # without a dictionary entry this is the heavy-atom template itself
+            fh.write(s.prepared.template_view_molblock or s.prepared.template_molblock)
+        s.receptor, s.template, s.template_view = receptor, template, template_view
+    else:  # separate files: only the receptor is new, the user's template stays where it is
+        with open(receptor, "w") as fh:
+            fh.write(s.protonated.pdb)
+        s.receptor = receptor
+    if s.protonated is not None:
+        with open(os.path.join(jobdir(s), f"{s.jobname}_protonation_report.txt"), "w") as fh:
+            fh.write(s.protonated.report_text())
+
+
 def previous_run(s, out):
     """Compare a folder's earlier run with the current choices.
 
@@ -710,7 +759,7 @@ def previous_run(s, out):
         ligands = temp
     try:
         current = ad.run_signature(s.template, ligands, s.receptor, s.anchor_num, s.anchor_mode, s.size,
-                                   s.samples, s.seed, s.query_smarts, s.anchor_indices)
+                                   s.samples, s.seed, s.query_smarts, s.anchor_indices, s.add_hydrogens)
     finally:
         if temp:
             os.remove(temp)
@@ -723,32 +772,296 @@ def previous_run(s, out):
 # --------------------------------------------------------------------------
 
 
-def step_files(s):
-    heading(1, "Receptor (the protein)")
-    say("  A PDB file of the protein, with hydrogens, without the ligand.")
-    say("  Press Tab to complete file names.\n")
-    mark = len(WARNINGS)
+def offer_hydrogens(s, info):
+    """If the receptor has no hydrogens, offer to have ADFR add them."""
+    if info["hydrogens"] > 0:
+        return
+    say("\n  Docking needs hydrogens on the receptor. ADFR can add them with a quick rule-based guess")
+    say("  (histidine protonation is not optimised). Receptors that already have hydrogens are not touched.")
+    s.add_hydrogens = ask_yes_no("Add hydrogens automatically?", True)
+    if s.add_hydrogens:
+        warn("Hydrogens will be added to the receptor by a quick guess; check histidine protonation if it matters "
+             "for your target.")
+    else:
+        warn("The receptor has no hydrogens and none will be added; the results will be poor.")
+
+
+def stage_receptor(s, text):
+    """Make `text` the receptor the rest of the wizard looks at (in a temporary folder, saved with the job later)."""
+    import atexit
+    import tempfile
+
+    folder = tempfile.mkdtemp(prefix="anchored_docking_receptor_")
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    s.receptor = os.path.join(folder, "receptor.pdb")
+    with open(s.receptor, "w") as fh:
+        fh.write(text)
+
+
+def step_protein(s, info, template_mol):
+    """Protein preparation: report gaps and missing atoms, then protonate at a chosen pH if there are no hydrogens."""
+    import numpy as np
+
+    import protein_prep as pp
+
+    say("\n  Protein preparation")
+    with open(s.receptor, errors="replace") as fh:
+        text = fh.read()
+    template_xyz = np.array([p for p, a in zip(template_mol.GetConformer().GetPositions(), template_mol.GetAtoms())
+                             if a.GetAtomicNum() > 1])
+    notes, urgent = pp.quality_lines(pp.read_residues(text), template_xyz)
+    for line in notes:
+        note(line)
+    for line in urgent:
+        warn(line)
+    if not notes and not urgent:
+        ok("No gaps in the chains and no residues with missing heavy atoms.")
+
+    if info["hydrogens"] > 0:
+        ok(f"The receptor already has hydrogens ({info['hydrogens']}); they are used as they are.")
+        note("Protonation states (histidine form, charged or neutral acids) are not checked. To have them "
+             "predicted, start from a receptor without hydrogens.")
+        return
+
+    say("\n  Docking needs hydrogens on the receptor. PDB2PQR with PROPKA predicts the charge state of each")
+    say("  residue at a pH you choose (histidine form, aspartate and glutamate, termini), places hydrogens so")
+    say("  that hydrogen bonds are satisfied, and rebuilds missing side-chain atoms. It takes about a minute.")
+    if ask_yes_no("Protonate the protein with PDB2PQR and PROPKA?", True):
+        ph = ask_number("pH", pp.DEFAULT_PH, minimum=0.0, maximum=14.0)
+        say("  Working...")
+        try:
+            prep = pp.protonate(text, template_xyz, ph)
+        except pp.ProteinPrepError as exc:
+            warn(f"Protonation with PDB2PQR did not work: {exc}")
+            note("Falling back to ADFR's quicker rule-based hydrogen placement.")
+            offer_hydrogens(s, info)
+            return
+        s.protonated = prep
+        s.original_receptor = s.receptor
+        stage_receptor(s, prep.pdb)
+        if s.prepared is not None:
+            s.prepared.receptor_pdb = prep.pdb
+        for line in prep.lines():
+            ok(line)
+        notable = [p for p in prep.pocket if p.notable]
+        if notable:
+            say(f"\n  Residues within {pp.POCKET_DISTANCE:g} A of the template that deserve a look:")
+            table([(p.label, f"{p.pka:.1f}", p.state) for p in notable], headers=("Residue", "pKa", "State"))
+        elif prep.pocket:
+            note(f"The {len(prep.pocket)} titratable residue(s) near the template all keep their usual state.")
+        for problem in prep.problems:
+            warn(f"PDB2PQR: {problem}.")
+        if prep.kept_without_hydrogens:
+            warn(f"{', '.join(prep.kept_without_hydrogens)} kept in the receptor got no hydrogens (PDB2PQR only "
+                 "protonates protein).")
+        note("The full record is saved with the results as <job name>_protonation_report.txt.")
+    else:
+        offer_hydrogens(s, info)
+
+
+def show_inventory(inv):
+    chains = ", ".join(f"{name} ({n} residues)" for name, n in inv.protein_chains.items())
+    ok(f"Protein chain(s): {chains}.")
+    if inv.nucleic_chains:
+        note(f"Nucleic acid chain(s) {', '.join(inv.nucleic_chains)} will not be used.")
+    others = [h for h in inv.hets if h.kind != "sugar"]
+    kinds = {}
+    for h in others:
+        kinds.setdefault(h.kind, []).append(h.name)
+    parts = [f"{len(names)} {kind}{'s' if len(names) > 1 and kind != 'additive' else ''} ({', '.join(sorted(set(names)))})"
+             for kind, names in kinds.items()]
+    note(f"Also in the file: {inv.waters} water(s)" + (f", {', '.join(parts)}" if parts else "")
+         + (f", {sum(1 for h in inv.hets if h.kind == 'sugar')} sugar residue(s)" if any(h.kind == "sugar" for h in inv.hets) else "")
+         + ".")
+
+
+def choose_template(inv):
+    """Ask which molecule is the template. Returns a structure_prep.Het, or None to give up on this file."""
+    import structure_prep as sp
+
+    candidates = sp.template_candidates(inv)
+    if not candidates:
+        fail("No molecule in this file is big enough to be a ligand, so there is no template to extract.")
+        return None
+    suggestion = sp.suggested_template(inv)
+    say("\n  Which molecule is the template ligand (the one to anchor to)?")
+    shown = candidates[:12]
+    table([(n, h.label, h.kind, h.heavy, h.contacts) for n, h in enumerate(shown, 1)],
+          headers=("#", "Molecule", "Kind", "Heavy atoms", "Protein contacts"))
+    if len(candidates) > len(shown):
+        note(f"{len(candidates) - len(shown)} smaller or less likely molecules are not shown.")
+    default = str(shown.index(suggestion) + 1) if suggestion in shown else None
+    if default is None:
+        warn("None of the molecules looks like a drug-like ligand; pick the one you want, if any.", record=False)
+
+    def pick(text):
+        if text.lower() in ("q", "none"):
+            return None
+        if text.isdigit() and 1 <= int(text) <= len(shown):
+            return shown[int(text) - 1]
+        raise ValueError(f"Enter a number from 1 to {len(shown)}, or q to choose another file.")
+
+    return ask("Template number (q = choose another file)", default, pick)
+
+
+def choose_chains(inv, distances):
+    """Ask which protein chains to keep (only when there is a choice)."""
+    import structure_prep as sp
+
+    defaults = sp.default_chains(distances)
+    if len(inv.protein_chains) == 1:
+        return list(inv.protein_chains)
+    say("\n  The structure has several protein chains. Chains touching the template's neighbourhood are")
+    say(f"  suggested (an atom within {sp.CHAIN_NEAR:g} A of the template).")
+    table([(name, n, f"{distances[name]:.1f}", "keep" if name in defaults else "") for name, n in inv.protein_chains.items()],
+          headers=("Chain", "Residues", "Nearest to template (A)", "Suggested"))
+
+    def validate(text):
+        names = text.replace(",", " ").split()
+        unknown = [n for n in names if n not in inv.protein_chains]
+        if unknown or not names:
+            raise ValueError(f"Choose from: {', '.join(inv.protein_chains)} (separated by spaces).")
+        return sorted(set(names), key=list(inv.protein_chains).index)
+
+    return ask("Chains to keep", " ".join(defaults), validate)
+
+
+def ask_molecules(plan):
+    """Ask, for each ion, cofactor or other molecule near the template, whether to keep it in the receptor."""
+    import structure_prep as sp
+
+    if not plan.ask:
+        return []
+    say("\n  Waters, crystallisation additives and sugars are removed. For the molecules below, decide whether")
+    say("  they belong to the receptor (for example a catalytic metal or a cofactor in the pocket).")
+    kept = []
+    if len(plan.ask) > sp.GROUP_ABOVE:
+        groups = {}
+        for het in plan.ask:
+            groups.setdefault(het.name, []).append(het)
+        say(f"  There are {len(plan.ask)} of them, so molecules of the same kind are asked about together.")
+        for name, members in groups.items():
+            nearest = min(h.distance for h in members)
+            if ask_yes_no(f"Keep all {len(members)} {name} ({members[0].kind}, nearest {nearest:.1f} A from the template)?",
+                          nearest <= sp.KEEP_DEFAULT_RADIUS):
+                kept.extend(members)
+        return kept
+    for het in plan.ask:
+        text = f"Keep {het.label} ({het.kind}, {het.heavy} atom{'s' if het.heavy != 1 else ''}, {het.distance:.1f} A from the template)?"
+        if ask_yes_no(text, sp.default_keep(het)):
+            kept.append(het)
+    return kept
+
+
+def stage_files(s, prepared):
+    """Write the cleaned receptor and template to a temporary folder so the rest of the wizard can use them."""
+    import atexit
+    import tempfile
+
+    folder = tempfile.mkdtemp(prefix="anchored_docking_")
+    atexit.register(shutil.rmtree, folder, ignore_errors=True)
+    s.receptor = os.path.join(folder, "receptor.pdb")
+    s.template = os.path.join(folder, "template.sdf")
+    with open(s.receptor, "w") as fh:
+        fh.write(prepared.receptor_pdb)
+    with open(s.template, "w") as fh:
+        fh.write(prepared.template_molblock)
+    s.prepared = prepared
+
+
+def prepare_from_complex(s):
+    """Guided clean-up of a protein-ligand complex. Sets s.receptor, s.template and s.prepared."""
+    import structure_prep as sp
+
+    say("  A PDB (.pdb) or mmCIF (.cif) file, for example downloaded from rcsb.org. It is only read: your")
+    say("  file is not changed. Press Tab to complete file names.\n")
     while True:
-        del WARNINGS[mark:]  # forget warnings about a file the user is replacing
-        s.receptor = ask("Receptor PDB file", validate=file_validator((".pdb",)), completer=path_completer)
+        s.structure_path = ask("Structure file", validate=file_validator(sp.STRUCTURE_EXTENSIONS),
+                               completer=path_completer)
+        try:
+            structure, n_models, altlocs = sp.load_structure(s.structure_path)
+            inv = sp.inventory(structure, n_models, altlocs, s.structure_path)
+        except sp.PrepError as exc:
+            fail(str(exc))
+            continue
+        say("")
+        show_inventory(inv)
+        template = choose_template(inv)
+        if template is None:
+            continue
+        break
+    distances = sp.measure_distances(inv, template)
+    chains = choose_chains(inv, distances)
+    plan = sp.plan_molecules(inv, template, chains)
+    keep = ask_molecules(plan)
+    say(f"\n  Looking up the chemistry of {template.name} at the PDB to give the template its hydrogens for display...")
+    try:
+        prepared = sp.prepare(structure, inv, template, chains, keep, ccd=sp.fetch_ccd)
+    except sp.PrepError as exc:
+        fail(str(exc))
+        raise SystemExit(1)
+    say("\n  What was done with the structure:")
+    for line in prepared.summary:
+        say(f"    - {line}")
+    if keep:
+        warn(f"Kept in the receptor: {', '.join(h.label for h in keep)}. Ions and cofactors may lack AutoDock "
+             "partial charges (ADFR reports this for metals such as zinc), which weakens their effect.")
+    stage_files(s, prepared)
+    return inv, template
+
+
+def step_files(s):
+    heading(1, "Protein structure")
+    say("  What do you have?")
+    say("    1. A structure file of the protein-ligand complex (PDB or mmCIF). The assistant cleans it up:")
+    say("       it extracts the template ligand and removes waters, additives and other chains.")
+    say("    2. A cleaned protein PDB file and a separate template ligand SDF file.")
+
+    def pick(text):
+        if text in ("1", "2"):
+            return text
+        raise ValueError("Please enter 1 or 2.")
+
+    from_complex = ask("Choose a number", "1", pick) == "1"
+    say("")
+    mark = len(WARNINGS)
+    if from_complex:
+        prepare_from_complex(s)
         info = analyse_receptor(s.receptor)
-        if report_receptor(info):
-            break
+        say("")
+        report_receptor(info, hydrogens_fixable=True, check_hetero=False)
+    else:
+        say("  A PDB file of the protein, without the ligand. Press Tab to complete file names.\n")
+        while True:
+            del WARNINGS[mark:]  # forget warnings about a file the user is replacing
+            s.receptor = ask("Receptor PDB file", validate=file_validator((".pdb",)), completer=path_completer)
+            info = analyse_receptor(s.receptor)
+            if report_receptor(info, hydrogens_fixable=True):
+                break
     receptor_coords = info["coords"]
 
     heading(2, "Template ligand")
-    say("  A ligand that is already in the right place in the receptor, e.g. from a crystal")
-    say("  structure (SDF file). Only the first molecule in the file is used.\n")
     mark = len(WARNINGS)
-    while True:
-        del WARNINGS[mark:]
-        s.template = ask("Template ligand SDF file", validate=file_validator((".sdf",)), completer=path_completer)
+    if from_complex:
+        say(f"  Taken from the structure: {s.prepared.template.label}.\n")
         template_mol = load_template(s.template)
-        extent = report_template(template_mol, receptor_coords, count_molecules(s.template))
-        if extent is not None:
-            break
+        extent = report_template(template_mol, receptor_coords, 1)
+        if extent is None:
+            fail("The extracted template could not be used. Choose the separate-files option instead.")
+            raise SystemExit(1)
+    else:
+        say("  A ligand that is already in the right place in the receptor, e.g. from a crystal")
+        say("  structure (SDF file). Only the first molecule in the file is used.\n")
+        while True:
+            del WARNINGS[mark:]
+            s.template = ask("Template ligand SDF file", validate=file_validator((".sdf",)), completer=path_completer)
+            template_mol = load_template(s.template)
+            extent = report_template(template_mol, receptor_coords, count_molecules(s.template))
+            if extent is not None:
+                break
     s.template_mol = template_mol
     s.extent = extent
+    step_protein(s, info, template_mol)
 
     heading(3, "Ligands to dock")
     say("  An SDF file with one or more ligands that share a core with the template.")
@@ -871,6 +1184,8 @@ def step_run_mode(s):
 
     say("\n  Results are written to an output folder; one numbered sub-folder per ligand.")
     protected = [s.receptor, s.template, s.ligands, REPO_DIR, os.getcwd(), os.path.expanduser("~"), "/"]
+    if s.structure_path:
+        protected.append(s.structure_path)
     default_out = os.path.join(os.path.dirname(s.ligands), "output")
     while True:
         s.resume, s.remaining = False, len(s.kept)
@@ -940,12 +1255,25 @@ def output_note(s):
 def step_review(s):
     heading(6, "Review")
     names = ", ".join(r.name for r in s.kept[:3]) + (" ..." if len(s.kept) > 3 else "")
-    rows = [("Receptor", s.receptor), ("Template", s.template),
-            ("Ligands", f"{len(s.kept)} of {s.all_count} in {s.ligands} ({names})"),
+    if s.prepared is not None:
+        receptor_path, template_path, _ = prepared_paths(s)
+        rows = [("Structure", s.structure_path),
+                ("Receptor", f"{receptor_path} (chains {', '.join(s.prepared.kept_chains)}, cleaned)"),
+                ("Template", f"{template_path} ({s.prepared.template.label})")]
+    elif s.protonated is not None:
+        rows = [("Receptor", f"{prepared_paths(s)[0]} (protonated from {s.original_receptor})"),
+                ("Template", s.template)]
+    else:
+        rows = [("Receptor", s.receptor), ("Template", s.template)]
+    rows += [("Ligands", f"{len(s.kept)} of {s.all_count} in {s.ligands} ({names})"),
             ("Anchors", f"{s.anchor_num} ({s.anchor_mode})"), ("Search box", f"{s.size} A"),
             ("Output folder", s.outdir + output_note(s))]
     if s.seed is not None:
         rows.append(("Random seed", s.seed))
+    if s.protonated is not None:
+        rows.append(("Protonation", f"PDB2PQR + PROPKA at pH {s.protonated.ph:g} ({s.protonated.hydrogens} hydrogens)"))
+    elif s.add_hydrogens:
+        rows.append(("Hydrogens", "added to the receptor by ADFR (quick rule-based guess)"))
     rows.append(("Delete intermediates", "yes" if s.clean else "no"))
     if s.mode != "run":
         rows += [("Partition / GPUs", f"{s.partition} / {s.gpus}"), ("Time limit", s.time_limit),
@@ -973,6 +1301,7 @@ def step_review(s):
 
 
 def write_script(s):
+    finalize_structure_files(s)
     prepare_ligand_file(s)
     os.makedirs(jobdir(s), exist_ok=True)
     s.script_path = os.path.join(jobdir(s), f"submit_{s.jobname}.sh")
@@ -1083,18 +1412,23 @@ def show_follow_up(job_id, s):
 def result_rows(s):
     """One row per ligand: from summary.tsv written by the job, falling back to the files on disk."""
     import anchored_docking as ad
+    import results
 
     summary = {int(r["index"]): r for r in ad.read_summary(s.outdir) if r.get("index", "").isdigit()}
     rows = []
     for n, ligand in enumerate(s.kept):
         info = summary.get(n)
-        has_pose = os.path.isfile(os.path.join(s.outdir, str(n), "ligand_docked.sdf"))
+        pose_file = os.path.join(s.outdir, str(n), "ligand_docked.sdf")
+        has_pose = os.path.isfile(pose_file)
+        energy = results.top_pose_scores(pose_file).get("free_energy", "") if has_pose else ""
         if info is None:
             status = "docked (not checked)" if has_pose else "not run"
-            rows.append({"index": n, "name": ligand.name, "status": status, "anchor": "", "rmsd": "", "note": ""})
+            rows.append({"index": n, "name": ligand.name, "status": status, "energy": energy, "anchor": "",
+                         "rmsd": "", "note": ""})
             continue
         status = {"docked": "docked", "flagged": "CHECK POSE", "failed": "FAILED"}.get(info["status"], info["status"])
-        rows.append({"index": n, "name": ligand.name, "status": status, "anchor": info.get("anchor_max_dev", ""),
+        rows.append({"index": n, "name": ligand.name, "status": status, "energy": energy,
+                     "anchor": info.get("anchor_max_dev", ""),
                      "rmsd": info.get("core_rmsd", ""), "note": info.get("note", "")})
     return rows
 
@@ -1102,8 +1436,8 @@ def result_rows(s):
 def show_results(s, job_id=None):
     rows = result_rows(s)
     say("\n  Results:")
-    table([(r["index"], r["name"][:30], r["status"], r["anchor"], r["rmsd"]) for r in rows],
-          headers=("Folder", "Ligand", "Result", "Anchor dev (A)", "Core RMSD (A)"))
+    table([(r["index"], r["name"][:30], r["status"], r["energy"], r["anchor"], r["rmsd"]) for r in rows],
+          headers=("Folder", "Ligand", "Result", "Energy (kcal/mol)", "Anchor dev (A)", "Core RMSD (A)"))
     docked = [r for r in rows if r["status"] in ("docked", "CHECK POSE", "docked (not checked)")]
     flagged = [r for r in rows if r["status"] == "CHECK POSE"]
     failed = [r for r in rows if r["status"] == "FAILED"]
@@ -1121,8 +1455,15 @@ def show_results(s, job_id=None):
         say("  Details are in error.txt inside each failed folder. After fixing the cause, run `pixi run dock` "
             "again with the same folder and answer yes to resume, to redo only the failed ligands.")
     if done:
-        say("\n  Each folder contains ligand_docked.sdf and view_results.pml (open it in PyMOL).")
-        say(f"  Scores:  grep RANKING {os.path.join(s.outdir, '0', 'ligand.dlg')}   (not kept if intermediates were deleted)")
+        say(f"\n  Files in {s.outdir}:")
+        say("    results.csv                 one row per ligand: status, energies, pose check")
+        say("    top_poses.sdf               the best pose of every docked ligand, with scores (all hydrogens)")
+        say("    all_poses.sdf               every cluster-lead pose of every ligand")
+        say("    view_all.pml                opens the protein, template and all ligands in one PyMOL session")
+        say("    <folder>/ligand_docked.sdf  the poses of one ligand;  <folder>/view_results.pml  to view just that one")
+        say("  The protein and template used for viewing have every hydrogen back (AutoDock merges the "
+            "non-polar ones away).")
+        say("  Energies include the anchoring bias, so use them to rank within this run, not against unbiased docking.")
     if done < len(s.kept) and job_id:
         log = f"{os.path.join(jobdir(s), s.jobname)}_{job_id}.log"
         if os.path.isfile(log):
@@ -1145,6 +1486,7 @@ def run_here(s):
         warn("No GPU is visible on this machine; AutoDock-GPU will fail here.")
         if not ask_yes_no("Run anyway?", False):
             return None
+    finalize_structure_files(s)
     prepare_ligand_file(s)
     os.makedirs(jobdir(s), exist_ok=True)
     say("\n  Running... (Ctrl+C to stop)\n")
@@ -1164,6 +1506,7 @@ def run_here(s):
 
 def check_environment():
     try:
+        import gemmi  # noqa: F401
         import meeko  # noqa: F401
         import rdkit  # noqa: F401
         import scipy  # noqa: F401

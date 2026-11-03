@@ -16,6 +16,7 @@ from rdkit.Chem import rdFMCS
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_DIR)
 import pose_check  # noqa: E402
+import results  # noqa: E402
 DEFAULT_ADFR_PATH = os.path.join(REPO_DIR, ".pixi", "envs", "adfr")
 ADGPU_BINARY_NAMES = ("adgpu", "autodock_gpu_128wi", "autodock_gpu_64wi", "autodock_gpu_256wi")
 
@@ -128,6 +129,13 @@ def parse_arguments():
     parser.add_argument("--random_seed", type=int, default=None, help="Random seed for sampling")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--clean", action="store_true", help="Clean the directory after docking")
+    parser.add_argument("--template_view_file", default=None,
+                        help="Only for display: the template with its hydrogens, when --template_file is a heavy-atom "
+                             "template whose bond orders are unknown. Without it, missing template hydrogens are added "
+                             "with RDKit, which needs real bond orders. Not used for docking.")
+    parser.add_argument("--add_hydrogens", action="store_true",
+                        help="Let ADFR add hydrogens to the receptor if it has none (a quick guess: histidine "
+                             "protonation is not optimised). Receptors that already have hydrogens are untouched.")
     parser.add_argument("--resume", action="store_true",
                         help="Continue a previous run in --docking_dir: ligands that already have a docked pose are "
                              "skipped, the others are redone. Inputs and docking settings must be unchanged.")
@@ -157,9 +165,10 @@ def file_digest(path):
 
 
 def run_signature(template_file, input_file, receptor_file, anchor_num, anchor_mode, size, samples,
-                  random_seed, query_smarts, anchor_indices):
+                  random_seed, query_smarts, anchor_indices, add_hydrogens=False):
     """Everything that decides what a docking run produces, so a resume can refuse to mix runs."""
     return {
+        "add_hydrogens": bool(add_hydrogens),
         "template_sha256": file_digest(template_file),
         "ligands_sha256": file_digest(input_file),
         "receptor_sha256": file_digest(receptor_file),
@@ -184,7 +193,9 @@ def read_run_settings(docking_dir):
     if not os.path.isfile(path):
         return None
     with open(path) as fh:
-        return json.load(fh)
+        settings = json.load(fh)
+    settings.setdefault("add_hydrogens", False)  # runs saved before this option existed did not add any
+    return settings
 
 
 def write_summary(docking_dir, rows):
@@ -411,7 +422,7 @@ def prepare_ligand(docking_dir, input_mol):
         check=True
     )
 
-def prepare_receptor(docking_dir, receptor_file, adfr_path):
+def prepare_receptor(docking_dir, receptor_file, adfr_path, add_hydrogens=False):
     receptor_pdb = os.path.join(docking_dir, "receptor.pdb")
     shutil.copy(receptor_file, receptor_pdb)
     prepare_receptor_cmd = [
@@ -421,6 +432,8 @@ def prepare_receptor(docking_dir, receptor_file, adfr_path):
         "-o",
         "receptor.pdbqt",
     ]
+    if add_hydrogens:
+        prepare_receptor_cmd += ["-A", "checkhydrogens"]  # only adds hydrogens if the file has none
     subprocess.run(prepare_receptor_cmd, cwd=docking_dir, check=True)
 
 def prepare_grid(docking_dir, scripts_path, autogrid_bin):
@@ -489,9 +502,10 @@ def generate_pymol_session(docking_dir, template_file, receptor_file):
     shutil.copy2(template_file, template_sdf)
 
     pml_content = """\
-# Load structures
-load receptor.pdb, receptor
-load template.sdf, template
+# Load structures. Run this script from inside this folder (pymol view_results.pml).
+# The receptor and template are the versions with every hydrogen, one folder up.
+load ../receptor_with_hydrogens.pdb, receptor
+load ../template_with_hydrogens.sdf, template
 load ligand_docked.sdf, docked_ligand
 
 # Style receptor
@@ -540,7 +554,7 @@ def main():
 
     signature = run_signature(args.template_file, args.input_file, args.receptor_file, args.anchor_num,
                               args.anchor_mode, args.size, args.samples, args.random_seed,
-                              args.query_smarts, args.anchor_indices)
+                              args.query_smarts, args.anchor_indices, args.add_hydrogens)
 
     # Prepare docking directory
     prepare_docking_directory(args.docking_dir, args.force, args.resume, signature)
@@ -556,6 +570,7 @@ def main():
 
     tools = {"adfr_path": adfr_path, "scripts_path": scripts_path, "adgpu_bin": adgpu_bin,
              "autogrid_bin": autogrid_bin}
+    prepare_view_files(args, adfr_path)
     rows = {}
     total = len(input_mols)
     for index, input_mol in enumerate(input_mols):
@@ -589,6 +604,14 @@ def main():
                 clean_directory(docking_dir)
         write_summary(args.docking_dir, rows)
 
+    try:
+        made = results.write_all(args.docking_dir)
+        print(f"Combined results: {results.RESULTS_CSV}, {results.TOP_POSES}, {results.ALL_POSES} "
+              f"({made['poses']} poses) and {results.VIEW_SCRIPT} in {args.docking_dir}")
+    except Exception as exc:  # the docking is done; a problem with the summary files must not hide that
+        print(f"Could not write the combined result files ({type(exc).__name__}: {exc}). "
+              f"You can retry with: python results.py {args.docking_dir}")
+
     failed = [r for r in rows.values() if r["status"] == "failed"]
     flagged = [r for r in rows.values() if r["status"] == "flagged"]
     docked = [r for r in rows.values() if r["status"] in ("docked", "flagged")]
@@ -605,6 +628,31 @@ def main():
     print("To visualise a result, open its PyMOL script: pymol <docking_dir>/<index>/view_results.pml")
     if failed:
         sys.exit(1)
+
+
+def prepare_view_files(args, adfr_path):
+    """Write the receptor and template with every hydrogen, for looking at the results.
+
+    AutoDock's own files have the non-polar hydrogens merged away, so they are not what to look at.
+    A failure here is reported but never stops the docking.
+    """
+    out = args.docking_dir
+    try:
+        n, how = results.make_view_receptor(args.receptor_file, adfr_path, args.add_hydrogens,
+                                            os.path.join(out, results.VIEW_RECEPTOR))
+        print(f"Receptor for viewing: {n} hydrogens ({how})", flush=True)
+    except Exception as exc:
+        print(f"Could not prepare the receptor with hydrogens for viewing ({type(exc).__name__}: {exc}); "
+              "the unmodified receptor is used.", flush=True)
+        shutil.copyfile(args.receptor_file, os.path.join(out, results.VIEW_RECEPTOR))
+    try:
+        n, how = results.make_view_template(args.template_file, os.path.join(out, results.VIEW_TEMPLATE),
+                                            args.template_view_file)
+        print(f"Template for viewing: {n} hydrogens ({how})", flush=True)
+    except Exception as exc:
+        print(f"Could not prepare the template with hydrogens for viewing ({type(exc).__name__}: {exc}); "
+              "the unmodified template is used.", flush=True)
+        shutil.copyfile(args.template_file, os.path.join(out, results.VIEW_TEMPLATE))
 
 
 def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
@@ -645,7 +693,7 @@ def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
     prepare_ligand(docking_dir, input_mol)
 
     # Prepare receptor.pdbqt
-    prepare_receptor(docking_dir, args.receptor_file, tools["adfr_path"])
+    prepare_receptor(docking_dir, args.receptor_file, tools["adfr_path"], args.add_hydrogens)
 
     # Prepare grid
     prepare_grid(docking_dir, tools["scripts_path"], tools["autogrid_bin"])

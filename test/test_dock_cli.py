@@ -659,9 +659,11 @@ def test_run_here_reports_a_missing_program_without_crashing(monkeypatch, tmp_pa
 # --------------------------------------------------------------------------
 
 
-def run_wizard(monkeypatch, answers):
+def run_wizard(monkeypatch, answers, from_complex=False):
+    """Run the whole wizard on scripted answers. By default the first question is answered with
+    'separate receptor and template files'; from_complex=True leaves it to the answers."""
     monkeypatch.setattr(sys, "argv", ["dock_cli.py"])
-    scripted_input(monkeypatch, answers)
+    scripted_input(monkeypatch, answers if from_complex else ["2", *answers])
     d.main()
 
 
