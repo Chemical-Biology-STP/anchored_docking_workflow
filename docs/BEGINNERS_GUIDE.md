@@ -10,7 +10,7 @@ This guide takes you from "I have a protein and some ligands" to "I have docked 
 2. [What you need before you start](#2-what-you-need-before-you-start)
 3. [Command line survival kit](#3-command-line-survival-kit)
 4. [One-time setup](#4-one-time-setup)
-5. [Prepare your three input files](#5-prepare-your-three-input-files)
+5. [Prepare your input files](#5-prepare-your-input-files)
 6. [Practice run with the example data](#6-practice-run-with-the-example-data)
 7. [Dock your own protein and ligands](#7-dock-your-own-protein-and-ligands)
 8. [Follow your job](#8-follow-your-job)
@@ -26,13 +26,14 @@ Normal docking lets a ligand move freely in the binding site. **Anchored docking
 
 The workflow finds the part of each new ligand that matches the template, picks a few atoms of that shared core as **anchors**, and gently pulls those atoms toward where the template has them. The rest of the molecule is free to find its best fit.
 
-You provide three files:
+You provide:
 
 | File | What it is |
 |---|---|
-| **Receptor** (`.pdb`) | The protein. |
-| **Template ligand** (`.sdf`) | A ligand already placed correctly in the protein. |
+| **Structure of the complex** (`.cif` or `.pdb`) | The protein with its bound ligand, for example downloaded from the PDB. The assistant extracts the template ligand and the cleaned protein from it. |
 | **Input ligands** (`.sdf`) | The ligand(s) you want to dock. One or many. |
+
+If you already have a cleaned protein and a template ligand as separate files, you can give those instead of the complex: a **receptor** (`.pdb`) and a **template ligand** (`.sdf`) already placed correctly in the protein.
 
 You get back, for every input ligand, a folder containing the docked pose (`ligand_docked.sdf`) and a script to view it in PyMOL.
 
@@ -42,7 +43,7 @@ You get back, for every input ligand, a folder containing the docked pose (`liga
 
 - [ ] An account on the HPC and the ability to log in to a **login node** with a terminal (ask your group or IT if you are unsure how).
 - [ ] A way to copy files between your computer and the HPC (for example, the file-transfer tool your institute recommends, or `scp`; see [section 5.4](#54-copy-the-files-to-the-hpc)).
-- [ ] Your three input files (see [section 5](#5-prepare-your-three-input-files)).
+- [ ] Your input files: a structure of the protein with its ligand, and the ligands to dock (see [section 5](#5-prepare-your-input-files)).
 - [ ] [PyMOL](https://pymol.org/) on your own computer to look at results (optional but recommended).
 
 ---
@@ -128,9 +129,18 @@ Setup is finished.
 
 ---
 
-## 5. Prepare your three input files
+## 5. Prepare your input files
 
-This is the step where most problems start, so go through it carefully. Put all three files in a folder **on your own computer** first, with simple names, for example:
+There are two ways to provide the protein and the template ligand. **Most people should use the first**: you give the assistant the structure file of the protein-ligand complex, and it does the clean-up for you. Your ligands to dock (section 5.3) are needed either way.
+
+Put your files in a folder **on your own computer** first, with simple names, for example:
+
+```
+complex.cif        (route A: the structure of the protein with its ligand)
+ligands.sdf        (the ligands you want to dock)
+```
+
+or, for route B:
 
 ```
 receptor.pdb
@@ -138,9 +148,41 @@ template.sdf
 ligands.sdf
 ```
 
+### 5.0 Easiest: start from the complex (route A)
+
+Download the structure of your protein with its bound ligand from the [PDB](https://www.rcsb.org): open the entry (for example `1M17`), choose **Download Files**, then **mmCIF Format** (a `.cif` file). A `.pdb` file also works.
+
+Nothing needs to be cleaned by hand. The assistant reads the file (your copy is never changed) and:
+
+- finds the molecules in it and **asks which one is the template ligand**, suggesting the most likely one;
+- **removes waters and crystallisation additives** (sulfate, glycerol, PEG and similar) automatically, and tells you what it removed;
+- **asks which protein chains to keep** if there are several, suggesting the ones next to the template;
+- **asks about each ion, cofactor or other molecule** near the template, so you decide whether it belongs to the receptor (for example a metal in the active site);
+- keeps only the first model and the first alternate conformation of each atom;
+- writes the cleaned protein and the template ligand into your output area for the job;
+- **prepares the protein**: it reports chain gaps and missing atoms, and if the structure has no hydrogens (most structures have none) it protonates the protein at a pH you choose (default 7.4); see [Protein preparation](#protein-preparation).
+
+Things to know:
+
+- The template is taken from the coordinates only; the structure file does not say which bonds are double, so the template is drawn with single bonds in PyMOL. This does not change the anchors or the docking (checked against a template with correct bonds).
+- Ions and cofactors that you keep may lack the partial charges AutoDock uses, which weakens their effect.
+- Protonation is predicted (PDB2PQR with PROPKA), not measured. The assistant lists the residues next to the template that deserve a look, and the full record is saved in `<job name>_protonation_report.txt`.
+
+### Protein preparation
+
+Docking needs hydrogens on the protein, and which hydrogens matter. A histidine can carry a hydrogen on either ring nitrogen or on both; an aspartate in a buried pocket may be neutral instead of negative. The assistant does this for you in step 2, for both routes:
+
+1. **Gaps and missing atoms are reported first.** A *gap* means residues are missing from the chain in the structure file (common in loops that the crystal did not resolve). A gap far from the template is only noted; one within 10 Å of the template, or a residue next to the template that lacks atoms, is shown as a warning, because the pocket shape may be wrong there. The assistant cannot invent missing loops; if the gap matters, model it elsewhere first.
+2. **If the protein has no hydrogens**, it asks whether to protonate it and at which pH. The default is **7.4**. It uses PDB2PQR with PROPKA: PROPKA predicts the pKa of every titratable residue from its surroundings, and PDB2PQR then chooses each histidine's form, protonates aspartates, glutamates and the chain ends accordingly, and places the hydrogens so that hydrogen bonds fit. It also rebuilds missing side-chain atoms and may turn the amide of an asparagine or glutamine, or a histidine ring, by 180° when that gives better hydrogen bonds. This takes under a minute for a typical protein.
+3. **What you see afterwards:** the residues within 6 Å of the template whose state is unusual or whose pKa is close to the pH (these are the ones worth a second look), and any residue PDB2PQR could not handle cleanly. The full record is saved as `<job name>_protonation_report.txt`: all unusual states, flipped side chains, rebuilt atoms, gaps, and a pKa for every titratable residue near the template. The protonated protein is saved as `<job name>_receptor.pdb` and is what is docked.
+
+If the protein **already has hydrogens**, they are used as they are and not checked. If you answer **no** to protonation, the assistant offers ADFR's quicker rule-based hydrogens, which treat every histidine as positively charged and give gap ends artificial charges. Ions and cofactors that you keep are not given hydrogens.
+
+If PDB2PQR fails for some reason, the assistant says so and falls back to the ADFR offer.
+
 ### 5.1 The receptor (`receptor.pdb`)
 
-Start from the same protein structure that your template ligand came from (for example, the PDB entry of the crystal structure). Then check:
+Route B only. Use this if you already have a cleaned protein, or you want full control. Start from the same protein structure that your template ligand came from (for example, the PDB entry of the crystal structure). Then check:
 
 - **Only the protein.** Remove the ligand, waters, ions and crystallisation additives unless you deliberately want to keep them. In PyMOL, you can do this with:
 
@@ -149,17 +191,19 @@ Start from the same protein structure that your template ligand came from (for e
   remove organic
   ```
 
-- **Hydrogen atoms must be present.** The receptor is processed *without* adding hydrogens, so a receptor with no hydrogens will give poor results. Many crystal structures from the PDB have none. To add them in PyMOL:
+- **Hydrogen atoms must be present**, or let the assistant add them. A receptor with no hydrogens gives poor results, and many crystal structures from the PDB have none. The assistant offers to protonate the protein for you (PDB2PQR with PROPKA, at pH 7.4 unless you choose otherwise). **A receptor that already has hydrogens is used exactly as it is**, including its histidine forms and charged or neutral acids; they are not checked. To add hydrogens yourself in PyMOL:
 
   ```
   h_add
   ```
 
-  PyMOL's hydrogen placement is quick but basic (for example, it makes no careful choice of histidine protonation states). If your project needs more care, protonate the protein with your preferred tool first.
+  PyMOL's hydrogen placement is quick but basic (for example, it makes no careful choice of histidine protonation states), so letting the assistant protonate a file without hydrogens is the better route.
 - **One structure only.** If the file holds several models or alternate conformations, keep one.
 - Save it in PDB format: in PyMOL, `File > Export Molecule...`, choose `PDB`.
 
 ### 5.2 The template ligand (`template.sdf`)
+
+Route B only.
 
 The template is a ligand that is **already in the right place in the receptor**. Typically this is the ligand from the crystal structure.
 
@@ -185,13 +229,13 @@ cd ~/anchored_docking_workflow
 mkdir my_project
 ```
 
-Now copy your three files from your computer into `~/anchored_docking_workflow/my_project/`. Two ways:
+Now copy your files from your computer into `~/anchored_docking_workflow/my_project/`. Two ways:
 
 - **With a file-transfer program** (graphical, drag and drop): connect to the HPC and drag the files into the `my_project` folder.
 - **With `scp`**: open a *new* terminal on **your own computer** (not the HPC) and type, replacing the parts in capitals:
 
   ```bash
-  scp receptor.pdb template.sdf ligands.sdf YOURNAME@LOGIN_NODE_ADDRESS:~/anchored_docking_workflow/my_project/
+  scp complex.cif ligands.sdf YOURNAME@LOGIN_NODE_ADDRESS:~/anchored_docking_workflow/my_project/
   ```
 
 Back on the HPC, check that they arrived:
@@ -200,7 +244,7 @@ Back on the HPC, check that they arrived:
 ls my_project
 ```
 
-You should see `ligands.sdf  receptor.pdb  template.sdf`.
+You should see your files, for example `ligands.sdf  complex.cif` (route A) or `ligands.sdf  receptor.pdb  template.sdf` (route B).
 
 ---
 
@@ -221,6 +265,7 @@ Answer like this:
 
 | Step | Question | What to type |
 |---|---|---|
+| 1 | What do you have? (Choose a number) | `2` (the example comes as a separate protein and template, see [5.1](#51-the-receptor-receptorpdb)) |
 | 1 | Receptor PDB file | `test/Bace1_protein.pdb` |
 | 2 | Template ligand SDF file | `test/crystal_ligand.sdf` |
 | 3 | Ligand SDF file | `test/CAT-13f.sdf` |
@@ -252,14 +297,29 @@ pixi run dock
 
 Always start from this folder (`anchored_docking_workflow`). Paths you type can be absolute (`/home/...`) or relative to this folder, for example `my_project/receptor.pdb`.
 
-### Steps 1 to 3: your three files
+### Steps 1 to 3: your protein, template and ligands
 
-Type the path to each file (Tab completes it). After each one the assistant checks it and explains any problem:
+The first question is **What do you have?** Answer `1` if you have a structure file of the protein with its ligand (route A, recommended), or `2` for a cleaned protein plus a separate template file (route B).
+
+**Route A (answer 1).** Type the path to your `.cif` or `.pdb` file. The assistant then asks, in this order:
+
+| Question | What to do |
+|---|---|
+| Template number | A table lists the molecules in the file with how many protein atoms each touches. The most likely template is suggested. Press Enter to accept it, type another number, or `q` to choose another file. If nothing in the file is ligand-sized, it tells you and asks for another file. |
+| Chains to keep | Only asked if there are several protein chains. The chains next to the template are suggested; press Enter to accept, or type letters separated by spaces. |
+| Keep *name* (ion/cofactor, N atoms, X Å from the template)? | One question for each ion, cofactor or other molecule within 12 Å of the template. Molecules within 5 Å of the template default to *keep*; others to *remove*. Say yes for something that belongs to the receptor, such as a catalytic metal. Molecules farther than 12 Å, waters, additives and sugars are removed without asking, and listed afterwards. If there are many, similar molecules are asked about together. |
+| Protonate the protein with PDB2PQR and PROPKA? / pH | Only asked if the structure has no hydrogens. Answer yes (the default) and accept pH 7.4 unless your target works at another pH (for example an acidic compartment). If you say no, you are offered ADFR's quicker rule-based hydrogens instead. |
+
+The assistant then prints **what was done with the structure**: which template and chains were used and everything that was removed. Read this list. The cleaned protein and the template are saved next to your results as `<job name>_receptor.pdb` and `<job name>_template.sdf`, and you can open them in PyMOL to check.
+
+**Route B (answer 2).** Type the path to the protein PDB file, then to the template SDF file. If the protein has no hydrogens you are asked about protonation (see [Protein preparation](#protein-preparation)); your own file is never changed, and the protonated copy is saved with the results.
+
+**Both routes, then:** type the path to your ligands. After each file the assistant checks it and explains any problem:
 
 | Check | What it tells you |
 |---|---|
-| Receptor has hydrogens | `[!]` if there are none. Fix this before continuing (see [5.1](#51-the-receptor-receptorpdb)); results will be poor otherwise. |
-| Receptor contains other molecules / several models | `[!]` as a reminder to clean the file. |
+| Receptor has hydrogens | `[!]` if there are none, followed by the offer to protonate. If you decline both offers, results will be poor. |
+| Receptor contains other molecules / several models (route B) | `[!]` as a reminder to clean the file. Route A removes these itself. |
 | Template has 3D coordinates | `[x]` if not; you must give a ligand that is positioned in the receptor. |
 | Template sits in the receptor | `[!]` if most of its atoms are far from the protein. This usually means the template and receptor are in different coordinate systems. Press Ctrl+C and re-export both from the same structure ([5.2](#52-the-template-ligand-templatesdf)). |
 | Template file holds one molecule | `[!]` if there are several; only the first is used. |
@@ -282,7 +342,7 @@ You are first offered the recommended settings: 3 anchors (or fewer if the weake
 | Random seed | A number that makes the anchor choice repeatable | Enter a whole number of 0 or higher, e.g. `1`, to be able to rerun and get the same anchors. Leave blank otherwise. |
 | Expert options | A manual core pattern (SMARTS) and debug output | Say `no` unless you know what a SMARTS pattern is. |
 
-Finally you are asked whether to **delete intermediate files** after each ligand. They take about 30 MB per ligand. The suggestion is `yes` for 10 or more ligands and `no` for fewer. Choose `no` if you want to look at scores later, because the score file (`ligand.dlg`) is deleted with the rest.
+Finally you are asked whether to **delete intermediate files** after each ligand. They take about 30 MB per ligand. The suggestion is `yes` for 10 or more ligands and `no` for fewer. Deleting them is safe for scores: they are kept in `results.csv` and in the SDF files.
 
 ### Step 5: how to run it
 
@@ -355,18 +415,33 @@ ls my_project/output/0
 
 ## 9. Look at the results
 
-Each ligand has its own folder, `output/0`, `output/1`, and so on. The important files are:
+The job does not write a PyMOL session. It writes PyMOL **scripts** (text files of PyMOL commands); the session file appears when you run a script in PyMOL.
+
+In your output folder you will find:
 
 | File | What it is |
 |---|---|
-| `ligand_docked.sdf` | The docked pose. Open it in any molecule viewer. |
-| `template.sdf` | A copy of your template ligand. |
-| `receptor.pdb` | A copy of your receptor. |
-| `view_results.pml` | A script that loads all three in PyMOL with sensible colours. |
-| `ligand.dlg` | The full AutoDock-GPU log, with scores. |
-| `anchor_positions.json` | The coordinates of the anchor points that were used. |
+| `results.csv` | **One row per ligand**: status, binding energy (and its parts), anchor deviation, core RMSD, failure reason. Opens in Excel. |
+| `top_poses.sdf` | The best pose of every docked ligand in one file, with the scores stored as data fields. |
+| `all_poses.sdf` | Every pose the docking kept (one representative per cluster of similar poses), for every ligand. `pose_rank` 1 is the best. |
+| `view_all.pml` | A PyMOL script that opens the protein, the template and **all** docked ligands in one session. |
+| `receptor_with_hydrogens.pdb`, `template_with_hydrogens.sdf` | The protein and template that the PyMOL scripts load, with every hydrogen. |
+| `summary.tsv`, `run_settings.json` | The per-ligand status, and the settings used (needed to resume). |
+| `0/`, `1/`, ... | One folder per ligand (see below). |
 
-If you chose to delete intermediate files, only the first four (plus `docking_results.pse` once you have run the PyMOL script) are kept.
+Inside each ligand's folder:
+
+| File | What it is |
+|---|---|
+| `ligand_docked.sdf` | The docked pose or poses for this ligand, as complete molecules with all hydrogens. Open it in any molecule viewer. |
+| `view_results.pml` | A PyMOL script that opens just this ligand with the protein and template. |
+| `pose_check.json`, `anchor_positions.json` | The pose check numbers, and the coordinates of the anchor points that were used. |
+| `error.txt` | Only if this ligand failed. |
+| `ligand.dlg` and other files | The raw AutoDock-GPU output and intermediate files. Deleted if you chose to delete intermediate files. |
+
+### Hydrogens
+
+AutoDock works with the non-polar hydrogens merged into their carbon atoms, so its own files are not what you want to look at. Everything you open in PyMOL has **all hydrogens back**: the docked ligands, the protein and the template. If your protein file had no hydrogens and you let the assistant add them, the protein you see is the one that was docked, plus its non-polar hydrogens. The polar hydrogens, which matter for hydrogen bonds, are exactly where they were during docking.
 
 ### 9.0 Reading the results table
 
@@ -376,6 +451,7 @@ When the job ends, the assistant prints a table with one row per ligand:
 |---|---|
 | Folder | The result folder number (`0`, `1`, ...). |
 | Result | `docked`, `CHECK POSE` or `FAILED`. |
+| Energy (kcal/mol) | The docking score of the best pose; more negative is better (see [9.3](#93-scores)). |
 | Anchor dev (A) | How far the most displaced anchor atom ended up from the position the template asked for. |
 | Core RMSD (A) | How far the shared core is from the template's core, averaged over all its atoms. |
 
@@ -400,30 +476,31 @@ scp -r YOURNAME@LOGIN_NODE_ADDRESS:~/anchored_docking_workflow/my_project/output
 ### 9.2 Open in PyMOL
 
 1. Start PyMOL.
-2. In the PyMOL command line (at the bottom of the window), move into one ligand's folder and run the script. Use the real path on your computer:
+2. In the PyMOL command line (at the bottom of the window), move into the output folder you copied and run the script. Use the real path on your computer:
 
    ```
-   cd /path/to/output/0
-   @view_results.pml
+   cd /path/to/output
+   @view_all.pml
    ```
 
-3. You see the receptor (grey cartoon), the template ligand (cyan) and the docked ligand (magenta).
+   (To look at one ligand only, move into its folder, for example `cd /path/to/output/0`, and run `@view_results.pml`.)
+
+3. You see the protein (grey cartoon, with the residues around the ligands as sticks), the template ligand (cyan) and every docked ligand (magenta; poses the pose check flagged are orange). The scripts save a `docking_all.pse` (or `docking_results.pse`) session file that you can reopen later without the script.
+
+PyMOL must be started from, or moved into, the folder holding the script, because the script refers to the other files by short relative names. If PyMOL says it cannot find a file, check the folder with `pwd` in the PyMOL command line.
 
 What to look for:
 
 - The docked ligand's **core should sit on top of the template's core**. That is the point of anchoring.
 - The rest of the ligand should sit in the pocket without clashing with the protein.
-- If the pose looks odd (flipped, far from the template, or clashing), try again with a different anchor strategy or seed (see [section 10](#10-something-went-wrong)).
+- A ligand with several poses holds them as separate *states*: use the arrows at the bottom right of the PyMOL window to step through them.
+- If a pose looks odd (flipped, far from the template, or clashing), try again with a different anchor strategy or seed (see [section 10](#10-something-went-wrong)).
 
 ### 9.3 Scores
 
-Open `ligand.dlg` and look for the ranking lines:
+The binding energies are in `results.csv` (column `free_energy`, in kcal/mol; more negative is better), in the results table printed at the end of the job, and in `top_poses.sdf`, where each molecule carries `free_energy`, `intermolecular_energy`, `internal_energy` and `cluster_size`. `cluster_size` is how many of the 20 docking runs ended in that pose.
 
-```bash
-grep RANKING my_project/output/0/ligand.dlg
-```
-
-Each line has several columns; the fourth is the estimated binding energy in kcal/mol (more negative is better). Keep in mind that the anchors add an artificial bias to the grid maps, so these numbers are only a rough guide and should not be compared with scores from unbiased docking. Use your eyes on the pose first.
+Keep in mind that the anchors add an artificial bias to the grid maps, so the energies are only a rough guide, are best used to rank ligands **within this run**, and should not be compared with scores from unbiased docking. Use your eyes on the pose first.
 
 ---
 
@@ -442,6 +519,11 @@ Most problems with input files are caught by the assistant before anything is su
 | `AutoDock-GPU binary not found ... PATH` | The modules were not loaded. For cluster jobs, check with `cat submit_<jobname>.sh` that it contains the two `module load` lines; if not, run `pixi run dock` again and keep the default modules. For "Run now", run `module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA` first. |
 | `GLIBCXX_3.4.29 not found` | `GCC/13.2.0` was not loaded before AutoDock-GPU. Make sure both modules are listed, with `GCC/13.2.0` first. |
 | `No GPU is visible on this machine` | You chose "Run now" on a machine without a GPU, such as the login node. Choose "Submit to the cluster queue" instead. |
+| `No molecule in this file is big enough to be a ligand` | The structure has no bound ligand (an apo structure), or only ions and tiny molecules. Choose a structure that contains your template ligand. |
+| `Could not read this file as a PDB or mmCIF structure` | The file is damaged or is not a structure file. Download it again from rcsb.org (mmCIF format). |
+| `No protein chain was found in this structure` | The file holds no protein, for example only DNA or a ligand. Check you downloaded the right entry. |
+| The suggested template is the wrong molecule | Type the number of the one you want in the table instead of pressing Enter. The table shows how many protein atoms each molecule touches, which helps to tell a bound drug from a stray molecule. |
+| Cofactor or ion you wanted is missing from the receptor | You answered no to it, or it was more than 12 Å from the template. Run the assistant again and answer yes; the summary after the questions lists what was removed. |
 | `[x]` "could not generate 3D coordinates" | RDKit could not build a 3D shape for this ligand, usually because of a strained ring system or impossible stereochemistry. Check the structure in your chemistry program, or let the assistant leave it out. |
 | Result `CHECK POSE` | The pose did not satisfy the anchoring. See [9.0](#90-reading-the-results-table). |
 | Result `FAILED` for a ligand | Read the reason in the table and the `error.txt` in that ligand's folder. Fix the cause, then run `pixi run dock` again with the same output folder and answer yes to resume. |
@@ -455,6 +537,9 @@ Most problems with input files are caught by the assistant before anything is su
 | Job disappeared and there are only some output folders | The time limit ran out. Increase the time limit and rerun (or put the remaining ligands in a new SDF file). |
 | Docked ligand is far from the template | The template and receptor are not in the same coordinate system. Re-export both from the **same** structure (see [5.2](#52-the-template-ligand-templatesdf)). |
 | Docked ligand clashes with the protein | The receptor may lack hydrogens or contain leftover molecules. Re-check [5.1](#51-the-receptor-receptorpdb). A larger search box or a different seed may also help. |
+| `Chain gap between ...` warning | Residues are missing in the structure (an unresolved loop). If the gap is near the template the pocket may be wrong there; the assistant cannot rebuild the loop. Consider a structure that has it, or model it first and use route B. |
+| `Protonation with PDB2PQR did not work` | The assistant falls back to ADFR's quicker hydrogens. The message gives the reason. Typical causes are a damaged residue or an unusual kept molecule; try again with that molecule removed. |
+| `PDB2PQR: ... hydrogens could not be placed without a clash` or `protonation failed` | That residue, usually next to a gap or a poorly resolved side chain, was left with the best guess PDB2PQR could make. Check it in the protonation report and in PyMOL if it is near the template. |
 | Results differ between runs | `random` anchor mode picks different anchors each run. Set a random seed to repeat a run exactly. |
 
 If you are still stuck, send your colleague or the maintainers: the **last 30 lines of the log** (`tail -n 30 <jobname>_<jobnumber>.log`) and the **contents of the job script** (`cat submit_<jobname>.sh`). Those two items answer most questions.

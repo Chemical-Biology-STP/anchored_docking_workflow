@@ -93,6 +93,8 @@ pixi run python anchored_docking.py \
 | `--adfr_path` | `.pixi/envs/adfr` | ADFRsuite installation directory |
 | `--scripts_path` | `scripts` | Path to the helper scripts directory |
 | `--force` | `False` | Overwrite the output directory if it already exists |
+| `--template_view_file` | `None` | Display only: the template with its hydrogens, for a heavy-atom template whose bond orders are unknown (the CLI sets this for templates taken from a structure file). Without it, missing template hydrogens are added with RDKit. Never used for docking |
+| `--add_hydrogens` | `False` | Let ADFR add hydrogens to the receptor if it has none (`prepare_receptor -A checkhydrogens`). Receptors that already have hydrogens are unchanged. Counts as a docking setting for `--resume` |
 | `--resume` | `False` | Continue a previous run in `--docking_dir`: ligands that already have a docked pose are skipped and the others are redone. Refused if the inputs or docking settings differ from the previous run. Cannot be combined with `--force` |
 | `--clean` | `False` | Remove intermediate files after docking |
 | `--verbose` | `False` | Print additional debug information (SMILES, SMARTS, etc.) |
@@ -107,7 +109,7 @@ pixi run python anchored_docking.py \
 6. Adds Gaussian bias potentials to grid maps at anchor positions
 7. Runs AutoDock-GPU with the biased maps
 8. Exports the docked pose as SDF
-9. Checks the pose against the anchoring (see below) and generates a PyMOL script (`view_results.pml`) for visualising the results
+9. Checks the pose against the anchoring (see below), then writes the PyMOL scripts, the combined result tables and the versions of the protein and template with every hydrogen (see [Output](#output))
 
 ### Pose check
 
@@ -124,15 +126,53 @@ A problem with one ligand (it cannot be read, has no shared core, fails 3D embed
 
 A ligand whose 3D coordinates cannot be generated is reported as failed. Earlier versions carried on with a flat 2D geometry, which Meeko accepted without complaint. Each embedding attempt is limited to 30 seconds.
 
-## Viewing results
+## Protein preparation
 
-After docking completes, each output subdirectory contains a `view_results.pml` script. Open it in [PyMOL](https://pymol.org/) to see the receptor, template ligand, and docked pose together:
+`pixi run dock` prepares the protein before docking (`protein_prep.py`); `anchored_docking.py` itself only uses the receptor it is given.
+
+- **Gaps and missing atoms** are reported for every receptor: consecutive residues whose C–N distance exceeds 2.0 Å (a real peptide bond is 1.33 Å), and standard residues lacking heavy atoms. They are shown as warnings when within 10 Å (gap) or 6 Å (residue) of the template.
+- **Protonation** is offered when the receptor has no hydrogens, at a pH you choose (default **7.4**), using [PDB2PQR](https://pdb2pqr.readthedocs.io) with [PROPKA](https://github.com/jensengroup/propka): predicted pKa values set the form of each histidine (HID/HIE/HIP), aspartate, glutamate, cysteine (disulfides become CYX), lysine and tyrosine, hydrogens are placed by hydrogen-bond-network optimisation, and missing heavy atoms are rebuilt. Receptors that already have hydrogens are used unchanged.
+- **Heavy atoms can move.** PDB2PQR flips Asn, Gln and His side chains when that improves hydrogen bonds (on the 1M17 test protein, two residues changed; the largest shift in a plain Bace1 run was 2.4 Å). Flipped residues are listed in the report.
+- The result is saved as `<job>_receptor.pdb` with `<job>_protonation_report.txt` (states, pKa values near the template, flips, rebuilt atoms, gaps). If PDB2PQR fails, or the user declines, the CLI offers ADFR's rule-based hydrogens (`--add_hydrogens`), which make every histidine cationic.
+- A kept ion or cofactor passes through PDB2PQR unchanged and gets no hydrogens.
+
+## Output
+
+The job writes no PyMOL session itself: it writes PyMOL **scripts**, and PyMOL saves the session when you run one.
+
+In the output folder:
+
+| File | What it is |
+|---|---|
+| `results.csv` | One row per ligand: status, free energy and its inter/intra parts, cluster size, number of poses, anchor deviation, core RMSD, failure reason. |
+| `top_poses.sdf` | The best pose of every docked ligand, with the scores and pose check as data fields. |
+| `all_poses.sdf` | Every cluster-lead pose of every docked ligand (`pose_rank` 1, 2, ...). |
+| `view_all.pml` | Opens the protein, the template and all docked ligands in one PyMOL session (flagged poses in orange) and saves `docking_all.pse`. |
+| `receptor_with_hydrogens.pdb`, `template_with_hydrogens.sdf` | The protein and template used for viewing, with every hydrogen. |
+| `summary.tsv`, `run_settings.json` | Per-ligand status for the run, and the settings used (for `--resume`). |
+| `<index>/ligand_docked.sdf` | That ligand's cluster-lead poses, complete molecules with scores in a `meeko` property. |
+| `<index>/view_results.pml` | Opens just that ligand with the protein and template, and saves `docking_results.pse`. |
+| `<index>/pose_check.json`, `anchor_positions.json`, `error.txt` | Pose check numbers, anchor targets, and the failure details if the ligand failed. |
+| `<index>/ligand.dlg` etc. | The raw AutoDock-GPU output and intermediates (removed with `--clean`). |
+
+Run the PyMOL scripts from inside the folder that holds them:
 
 ```bash
-pymol test/output/0/view_results.pml
+cd test/output && pymol view_all.pml        # everything in one session
+cd test/output/0 && pymol view_results.pml  # one ligand
 ```
 
-This loads all three structures with sensible colours and styling, and saves a `docking_results.pse` session file you can reopen later without the script.
+The combined files can be rebuilt from an existing run with `pixi run python results.py <docking_dir>`.
+
+### Hydrogens
+
+AutoDock merges non-polar hydrogens into their carbons, so its own files are not what you want to look at. For viewing, every molecule has all its hydrogens:
+
+- **Ligands:** Meeko already writes the complete molecule, so the poses in `ligand_docked.sdf` have every hydrogen (checked: 23 of 23 for the example ligand, bond lengths 1.04 to 1.10 Å).
+- **Protein:** if your receptor file had hydrogens it is shown as supplied. If ADFR added them (`--add_hydrogens`), ADFR is run a second time without merging the non-polar ones. The polar hydrogens come out at exactly the coordinates used for docking (checked: 538 of 538 at 0.0000 Å), plus the non-polar ones.
+- **Template:** shown with its hydrogens. A template given as SDF gets any missing hydrogens added by RDKit. A template taken from a structure file has no bond orders, so its hydrogens come from the PDB's chemical component dictionary for that residue name (fetched from files.rcsb.org when you run the CLI). This is checked: every heavy atom must match and the hydrogen count must equal the dictionary's, otherwise it is shown without hydrogens and the reason is printed. The docking itself always uses the heavy-atom template.
+
+The protein's non-polar hydrogens and its histidine protonation are a quick rule-based placement, not an optimised one.
 
 ## Interactive CLI
 
@@ -142,8 +182,9 @@ The easiest way to run the workflow is the interactive command-line interface:
 pixi run dock
 ```
 
-(or `pixi shell` followed by `dock`). It asks for the receptor, template ligand and ligand files one at a time, with Tab completion for paths, and checks each input as you go:
+(or `pixi shell` followed by `dock`). It starts from either a **protein-ligand complex** (PDB or mmCIF, for example straight from rcsb.org) or a cleaned receptor plus a separate template SDF. From a complex it does the clean-up for you (see below). It asks for each file in turn, with Tab completion for paths, and checks each input as you go:
 
+- **Complex:** finds the molecules in the file and asks which is the template (suggesting the most likely one), asks which protein chains to keep (suggesting those near the template), and asks about each ion, cofactor or other molecule near the template. Waters, crystallisation additives (sulfate, glycerol, PEG, ...), sugars, other copies of the template and molecules more than 12 Å away are removed without asking; everything removed is listed. It keeps the first model and the first alternate location, writes a cleaned receptor and the extracted template next to the results (your input is never modified), and offers to add hydrogens if there are none (ADFR's `-A checkhydrogens`, a quick guess that does not optimise histidine protonation). The template's bond orders are not in a structure file, so it is written with single bonds; this does not affect the shared core or the anchors. Only the first model of mmCIF/PDB files is used and nucleic acid chains are dropped.
 - **Receptor:** warns if it has no hydrogens, still contains other molecules, or has several models or alternate locations.
 - **Template:** checks it has real 3D coordinates and sits in the receptor, which catches a template and receptor in different coordinate systems. Warns if the file holds several molecules (only the first is used).
 - **Ligands:** runs the same core and anchor search the docking uses on every ligand, tries the same 3D embedding, and flags ligands with no or a tiny shared core, no 3D geometry, several fragments (salts), or atoms AutoDock has no atom type for. Flagged ligands can be left out before the job starts.
