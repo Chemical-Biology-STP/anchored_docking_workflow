@@ -27,6 +27,11 @@ sys.path.insert(0, REPO_DIR)
 
 DEFAULT_MODULES = "GCC/13.2.0,AutoDock-GPU/1.5.3-CUDA"
 DEFAULT_PARTITION = "ga100"
+# CUDA compute capability of the GPUs behind each known partition; a custom AutoDock-GPU build only runs on
+# the capabilities it was built for (its `targets` file). A partition not listed here is not checked.
+PARTITION_COMPUTE = {"ga100": "80", "gh100": "90"}
+# Partitions that can only be used together with a reservation.
+PARTITION_RESERVATION = {"gh100": "h100"}
 # Deliberately generous: the Bace1 example takes about 2 minutes per ligand.
 MINUTES_PER_LIGAND = 10
 MIN_TIME_MINUTES = 30
@@ -255,6 +260,29 @@ def find_custom_build():
         if limit > MAX_ATOM_TYPES and (best is None or limit > best[1]):
             best = (folder, limit)
     return best
+
+
+def build_targets(folder):
+    """Compute capabilities a custom build was made for (from its `targets` file), or None if unknown."""
+    try:
+        with open(os.path.join(folder, "targets")) as fh:
+            return fh.read().split()
+    except OSError:
+        return None
+
+
+def build_problem(s):
+    """Why the chosen custom AutoDock-GPU would not run on the chosen partition, or None."""
+    if not s.adg_path:
+        return None
+    wanted = PARTITION_COMPUTE.get(s.partition)
+    have = build_targets(s.adg_path)
+    if wanted is None or have is None:
+        return None
+    if wanted not in have:
+        return (f"The custom AutoDock-GPU in {s.adg_path} was built for compute capability {' '.join(have)}, but "
+                f"partition {s.partition} has GPUs of capability {wanted}. It would fail there.")
+    return None
 
 
 def atom_type_limit(s=None):
@@ -647,6 +675,7 @@ class Settings:
     mode: str = "submit"
     jobname: str = "anchored_dock"
     partition: str = DEFAULT_PARTITION
+    reservation: str = ""
     gpus: int = 1
     time_limit: str = "0:30:00"
     modules: str = DEFAULT_MODULES
@@ -710,6 +739,7 @@ def multiline_command(prefix, args):
 def build_script(s):
     lines = ["#!/bin/bash",
              f"#SBATCH --partition={s.partition}",
+             *([f"#SBATCH --reservation={s.reservation}"] if s.reservation else []),
              f"#SBATCH --gres=gpu:{s.gpus}",
              f"#SBATCH --job-name={s.jobname}",
              f"#SBATCH --output={os.path.join(jobdir(s), s.jobname)}_%j.log",
@@ -1145,7 +1175,10 @@ def offer_custom_build(s):
     folder, limit = build
     say(f"\n  A ligand has {biggest} usable anchor atoms, and a custom AutoDock-GPU with a limit of {limit} atom types")
     say(f"  (instead of {MAX_ATOM_TYPES}) is available in {folder}.")
-    note("It was built for A100 GPUs (the ga100 partition) only.")
+    have = build_targets(folder)
+    if have:
+        names = {"80": "A100 (ga100)", "90": "H100 (gh100)"}
+        note("It was built for: " + ", ".join(names.get(t, f"compute capability {t}") for t in have) + ".")
     if ask_yes_no("Use the custom AutoDock-GPU?", True):
         s.adg_path = folder
 
@@ -1307,11 +1340,18 @@ def step_run_mode(s):
     s.pixi_dir = os.path.dirname(pixi) if pixi else ""
     if ask_yes_no("Change partition, GPUs, modules or pixi location?", False):
         s.partition = ask("Partition", s.partition)
+        s.reservation = ask("Reservation (type none for no reservation)", PARTITION_RESERVATION.get(s.partition, "none"),
+                            lambda t: "" if t.lower() == "none" else t)
         s.gpus = ask_number("Number of GPUs", s.gpus, int, 1)
         s.modules = ask("Modules to load (comma-separated; GCC must come first)", s.modules)
         s.pixi_dir = ask("Folder containing the pixi program", s.pixi_dir or os.path.expanduser("~/.local/bin"))
     elif not s.pixi_dir:
         s.pixi_dir = ask("Folder containing the pixi program", os.path.expanduser("~/.local/bin"))
+    problem = build_problem(s)
+    if problem:
+        warn(problem, record=False)
+        if ask_yes_no("Use the cluster's AutoDock-GPU instead (a ligand may then get fewer anchors)?", True):
+            s.adg_path = ""
 
 
 def output_note(s):
@@ -1330,6 +1370,9 @@ def anchors_text(s):
 
 def step_review(s):
     heading(6, "Review")
+    problem = build_problem(s)
+    if problem:
+        warn(problem)
     names = ", ".join(r.name for r in s.kept[:3]) + (" ..." if len(s.kept) > 3 else "")
     if s.prepared is not None:
         receptor_path, template_path, _ = prepared_paths(s)
@@ -1346,14 +1389,16 @@ def step_review(s):
             ("Output folder", s.outdir + output_note(s))]
     if s.seed is not None:
         rows.append(("Random seed", s.seed))
+    rows.append(("AutoDock-GPU", f"custom build in {s.adg_path} ({atom_type_limit(s)} atom types)" if s.adg_path
+                 else f"cluster module ({MAX_ATOM_TYPES} atom types)"))
     if s.protonated is not None:
         rows.append(("Protonation", f"PDB2PQR + PROPKA at pH {s.protonated.ph:g} ({s.protonated.hydrogens} hydrogens)"))
     elif s.add_hydrogens:
         rows.append(("Hydrogens", "added to the receptor by ADFR (quick rule-based guess)"))
     rows.append(("Delete intermediates", "yes" if s.clean else "no"))
     if s.mode != "run":
-        rows += [("Partition / GPUs", f"{s.partition} / {s.gpus}"), ("Time limit", s.time_limit),
-                 ("Job name", s.jobname)]
+        rows += [("Partition / GPUs", f"{s.partition} / {s.gpus}" + (f" (reservation {s.reservation})" if s.reservation else "")),
+                 ("Time limit", s.time_limit), ("Job name", s.jobname)]
     action = {"submit": "Submit the job to the queue", "run": "Run the docking now",
               "save": "Save the job script"}[s.mode]
     rows.append(("Action", action))

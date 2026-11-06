@@ -147,9 +147,10 @@ scripts/build_autodock_gpu.sh /path/to/AutoDock-GPU 64
 ```
 
 - It needs the CUDA and GCC modules. The defaults are `CUDA/12.1.1` and `GCC/12.3.0`, because CUDA 12.1 rejects GCC 13. It takes a few minutes and does not need a GPU.
-- It builds for compute capability 80 (the A100 GPUs of `ga100`) unless `TARGETS` is set, with 128 work-items like the module. The result is in `bin/adgpu_atypes64/`, together with a `max_atom_types` file.
+- It builds one binary for compute capabilities 80 and 90 (the A100 GPUs of `ga100` and the H100 GPUs of `gh100`) unless `TARGETS` is set, with 128 work-items like the module. A binary only runs on the capabilities it contains: an 80-only build fails on an H100 with `Assertion '0' failed` in `SetKernelsGpuData`. The result is in `bin/adgpu_atypes64/`, together with `max_atom_types` and `targets` files; the wizard reads the latter and refuses a build that does not match the partition's GPUs.
+- The cluster module's own binary contains code for compute capabilities 50 to 90, so it needs no such care.
 - Use it with `--adg_path bin/adgpu_atypes64`. The script reads the limit from that file; `pixi run dock` offers the build when a ligand has more than 24 usable anchor atoms.
-- Tested on the A100 nodes: a 30-anchor ligand fails on the module's binary and docks with the 64-type build. Nothing else was changed in the AutoDock-GPU source, and for a ligand that fits 32 types the two binaries gave the same result in the one comparison made (free energy −9.32 against −9.33 kcal/mol, same anchors, same pose check).
+- Tested on an A100 node and on an H100 node (`gh100`, reservation `h100`): a 30-anchor ligand gets 29 anchors with the module's binary and all 30 with the 64-type build, on both GPU types. Nothing else was changed in the AutoDock-GPU source, and for a ligand that fits 32 types the two binaries gave the same result in the one comparison made (free energy −9.32 against −9.33 kcal/mol, same anchors, same pose check).
 
 ## Output
 

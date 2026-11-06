@@ -11,13 +11,14 @@
 #   output folder    default <repo>/bin/adgpu_atypes<N>
 #
 # Environment variables:
-#   TARGETS   CUDA compute capabilities to build for (default 80, the A100 GPUs of the ga100 partition)
+#   TARGETS   CUDA compute capabilities to build for, in one binary (default "80 90": the A100 GPUs of the
+#             ga100 partition and the H100 GPUs of gh100). A binary only runs on the capabilities it contains.
 #   NUMWI     work-items per block: 32, 64, 128 or 256 (default 128)
 #   JOBS      parallel compile jobs (default 4)
 # CUDA_MODULES, GCC_MODULE   modules to load (defaults: CUDA/12.1.1 and GCC/12.3.0; CUDA 12.1 does not accept GCC 13)
 #
-# The output folder gets the binary (autodock_gpu_<NUMWI>wi) and a file max_atom_types with the limit, which
-# dock_cli.py reads to know how many anchors it may ask for. Point the docking at it with --adg_path.
+# The output folder gets the binary (autodock_gpu_<NUMWI>wi), a file max_atom_types with the limit and a file
+# targets with the compute capabilities, which dock_cli.py reads. Point the docking at it with --adg_path.
 
 set -euo pipefail
 
@@ -25,7 +26,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE="${1:?Usage: $0 <AutoDock-GPU source folder> [max atom types] [output folder]}"
 MAX_TYPES="${2:-64}"
 OUTPUT="${3:-$REPO_DIR/bin/adgpu_atypes$MAX_TYPES}"
-TARGETS="${TARGETS:-80}"
+TARGETS="${TARGETS:-80 90}"
 NUMWI="${NUMWI:-128}"
 JOBS="${JOBS:-4}"
 CUDA_MODULES="${CUDA_MODULES:-CUDA/12.1.1}"
@@ -84,4 +85,5 @@ fi
 mkdir -p "$OUTPUT"
 cp "$BINARY" "$OUTPUT/"
 echo "$MAX_TYPES" > "$OUTPUT/max_atom_types"
-echo "Built $OUTPUT/autodock_gpu_${NUMWI}wi with a limit of $MAX_TYPES atom types."
+echo "$TARGETS" > "$OUTPUT/targets"
+echo "Built $OUTPUT/autodock_gpu_${NUMWI}wi with a limit of $MAX_TYPES atom types for compute capability $TARGETS."

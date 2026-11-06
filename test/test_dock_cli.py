@@ -736,6 +736,89 @@ def test_wizard_recommends_spreading_anchors_over_the_whole_core(monkeypatch, tm
     assert "up to" in text and "per ligand, spread across the shared core" in text      # the review table
 
 
+def custom_build(tmp_path, targets):
+    folder = tmp_path / "bin" / "adgpu_atypes64"
+    folder.mkdir(parents=True)
+    binary = folder / "autodock_gpu_128wi"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    (folder / "max_atom_types").write_text("64")
+    if targets is not None:
+        (folder / "targets").write_text(targets)
+    return folder
+
+
+def test_a_reservation_is_written_to_the_job_script_only_when_set(tmp_path):
+    with_reservation = d.build_script(make_settings(tmp_path, partition="gh100", reservation="h100"))
+    assert "#SBATCH --partition=gh100\n#SBATCH --reservation=h100\n" in with_reservation
+    assert "--reservation" not in d.build_script(make_settings(tmp_path))
+
+
+def test_the_gpu_types_a_custom_build_supports_are_read_from_its_targets_file(tmp_path):
+    assert d.build_targets(str(custom_build(tmp_path, "80 90\n"))) == ["80", "90"]
+    assert d.build_targets(str(tmp_path / "missing")) is None
+
+
+@pytest.mark.parametrize("targets, partition, problem", [
+    ("80", "ga100", False), ("80", "gh100", True), ("90", "ga100", True), ("80 90", "ga100", False),
+    ("80 90", "gh100", False), ("80", "some_other_partition", False), (None, "gh100", False)])
+def test_a_custom_build_is_checked_against_the_partitions_gpus(tmp_path, targets, partition, problem):
+    folder = custom_build(tmp_path, targets)
+    text = d.build_problem(d.Settings(adg_path=str(folder), partition=partition))
+    assert bool(text) is problem
+    if problem:
+        assert partition in text and "would fail" in text
+
+
+def test_nothing_is_checked_when_the_cluster_module_is_used():
+    assert d.build_problem(d.Settings(partition="gh100")) is None
+
+
+def test_wizard_sets_a_partition_and_the_matching_reservation(monkeypatch, tmp_path, capsys):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"),
+                             "", "",                              # job name, time limit
+                             "yes", "gh100", "", "", "", "",      # change settings: partition, reservation (default), GPUs, modules, pixi
+                             ""])                                 # confirm
+    script = (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+    assert "#SBATCH --partition=gh100" in script and "#SBATCH --reservation=h100" in script
+    assert "reservation h100" in capsys.readouterr().out
+
+
+def test_wizard_can_drop_the_reservation(monkeypatch, tmp_path):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"),
+                             "", "", "yes", "gh100", "none", "", "", "", ""])
+    assert "--reservation" not in (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+
+
+def wizard_with_custom_build(monkeypatch, tmp_path, targets, partition):
+    folder = custom_build(tmp_path, targets)
+    monkeypatch.setattr(d, "find_custom_build", lambda: (str(folder), 64))
+    monkeypatch.setattr(d, "CUSTOM_BUILD_FROM_ANCHORS", 5)         # the example has 17 usable anchors
+    answers = [RECEPTOR, TEMPLATE, LIGAND, "", "", "",              # custom build offer, recommended settings, clean
+               save_choice(), str(tmp_path / "o"), "", ""]
+    answers += ["yes", partition, "", "", "", ""] if partition != d.DEFAULT_PARTITION else ["no"]
+    answers += ["", ""]                                             # fall back to the module (if asked), confirm
+    run_wizard(monkeypatch, answers)
+    return folder, (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+
+
+def test_a_custom_build_for_the_wrong_gpu_is_replaced_by_the_cluster_module(monkeypatch, tmp_path, capsys):
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80", "gh100")
+    assert "--adg_path" not in script
+    assert "would fail" in capsys.readouterr().out
+
+
+def test_a_custom_build_for_both_gpus_is_kept_on_either_partition(monkeypatch, tmp_path, capsys):
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80 90", "gh100")
+    assert f"--adg_path {folder}" in script and "would fail" not in capsys.readouterr().out
+
+
+def test_the_offer_names_the_gpus_the_custom_build_was_made_for(monkeypatch, tmp_path, capsys):
+    wizard_with_custom_build(monkeypatch, tmp_path, "80 90", d.DEFAULT_PARTITION)
+    text = capsys.readouterr().out
+    assert "A100 (ga100)" in text and "H100 (gh100)" in text
+
+
 def test_wizard_asks_for_a_maximum_in_spread_mode_and_no_seed(monkeypatch, tmp_path, capsys):
     run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND,
                              "no",                  # not the recommended settings

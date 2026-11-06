@@ -361,7 +361,7 @@ For cluster jobs you are also asked for:
 
 - **Job name:** anything recognisable.
 - **Time limit:** the suggestion allows 10 minutes per ligand (at least 30 minutes). The example ligand needed about 2 minutes, but bigger proteins and ligands take longer. If the time runs out, the job is stopped, so raise it for large jobs.
-- **Change partition, GPUs, modules or pixi location?** Say `no`. The defaults are the GPU partition `ga100`, 1 GPU, modules `GCC/13.2.0` and `AutoDock-GPU/1.5.3-CUDA` (both are required: AutoDock-GPU only works with GCC 13.2), and the pixi folder found automatically.
+- **Change partition, GPUs, modules or pixi location?** Say `no`. The defaults are the GPU partition `ga100`, 1 GPU (for the H100 nodes enter partition `gh100`; the assistant then suggests the reservation `h100`, which that partition requires), modules `GCC/13.2.0` and `AutoDock-GPU/1.5.3-CUDA` (both are required: AutoDock-GPU only works with GCC 13.2), and the pixi folder found automatically.
 
 ### Step 6: review
 
