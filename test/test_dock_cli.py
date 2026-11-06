@@ -263,12 +263,35 @@ def test_box_limit_matches_the_grid_point_limit():
     assert d.grid_points(d.MAX_BOX_SIZE + 1) > d.MAX_GRID_POINTS
 
 
-def test_anchor_limit_follows_the_atom_type_limit():
-    with open(os.path.join(REPO, "scripts", "write-gpf.py")) as fh:
-        line = next(l for l in fh if l.startswith("ligand_types "))
-    assert d.standard_ligand_types() == len(line.split()) - 1
-    assert d.max_anchor_count() == d.MAX_ATOM_TYPES - d.standard_ligand_types()
-    assert d.max_anchor_count() >= 3
+def test_a_custom_build_is_passed_to_the_docking_script(tmp_path):
+    args = d.build_args(make_settings(tmp_path, adg_path="/builds/adgpu_atypes64"))
+    assert args[args.index("--adg_path") + 1] == "/builds/adgpu_atypes64"
+    assert "--adg_path" not in d.build_args(make_settings(tmp_path))
+
+
+def test_the_atom_type_limit_is_the_stock_one_unless_a_custom_build_is_used(tmp_path):
+    assert d.atom_type_limit() == d.MAX_ATOM_TYPES == 32
+    assert d.atom_type_limit(d.Settings()) == 32
+    folder = tmp_path / "custom"
+    folder.mkdir()
+    (folder / "autodock_gpu_128wi").write_text("#!/bin/sh\n")
+    (folder / "max_atom_types").write_text("64\n")
+    assert d.atom_type_limit(d.Settings(adg_path=str(folder))) == 64
+    assert d.atom_type_limit(d.Settings(adg_path=str(tmp_path / "nothing"))) == 32
+
+
+def test_a_custom_build_is_found_in_the_bin_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "REPO_DIR", str(tmp_path))
+    assert d.find_custom_build() is None
+    for name, limit in (("adgpu_atypes48", 48), ("adgpu_atypes96", 96), ("adgpu_atypes_broken", 99)):
+        folder = tmp_path / "bin" / name
+        folder.mkdir(parents=True)
+        (folder / "max_atom_types").write_text(str(limit))
+        if name != "adgpu_atypes_broken":                     # no binary: not usable
+            binary = folder / "autodock_gpu_128wi"
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+    assert d.find_custom_build() == (str(tmp_path / "bin" / "adgpu_atypes96"), 96)
 
 
 def test_disk_estimate_grows_with_the_number_of_anchors():
@@ -302,8 +325,8 @@ def test_negative_seed_is_rejected_then_valid_one_accepted(monkeypatch, capsys):
 
 
 def test_numbers_above_the_maximum_are_rejected(monkeypatch):
-    scripted_input(monkeypatch, [str(d.max_anchor_count() + 1), "4"])
-    assert d.ask_number("Anchors", 3, int, 1, maximum=d.max_anchor_count()) == 4
+    scripted_input(monkeypatch, [str(d.MAX_ATOM_TYPES + 1), "4"])
+    assert d.ask_number("Anchors", 3, int, 1, maximum=d.MAX_ATOM_TYPES) == 4
 
 
 def test_blank_seed_means_none(monkeypatch):
@@ -582,7 +605,7 @@ def old_run(tmp_path, done=1, **changes):
     out = tmp_path / "output"
     out.mkdir()
     values = dict(template_file=TEMPLATE, input_file=LIGAND, receptor_file=RECEPTOR,
-                  anchor_num=d.max_anchor_count(),
+                  anchor_num=d.MAX_ATOM_TYPES,
                   anchor_mode="spread", size=20.0, samples=100, random_seed=None, query_smarts=None,
                   anchor_indices=None)
     values.update(changes)
@@ -701,7 +724,7 @@ def test_wizard_saves_a_job_script_for_the_example(monkeypatch, tmp_path, capsys
     script = (tmp_path / "submit_dock_CAT-13f.sh").read_text()
     assert f"--docking_dir {out}" in script
     assert f"--receptor_file {RECEPTOR}" in script
-    assert f"--anchor_num {d.max_anchor_count()}" in script and "--anchor_mode spread" in script
+    assert f"--anchor_num {d.MAX_ATOM_TYPES}" in script and "--anchor_mode spread" in script
     assert "Job script saved" in capsys.readouterr().out
     assert not out.exists()  # saving a script must not run anything
 
@@ -709,7 +732,7 @@ def test_wizard_saves_a_job_script_for_the_example(monkeypatch, tmp_path, capsys
 def test_wizard_recommends_spreading_anchors_over_the_whole_core(monkeypatch, tmp_path, capsys):
     run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "", "", ""])
     text = capsys.readouterr().out
-    assert "spread across the shared core" in text and f"at most {d.max_anchor_count()}" in text
+    assert "every usable core atom as an anchor" in text and "supports 32 atom types" in text
     assert "up to" in text and "per ligand, spread across the shared core" in text      # the review table
 
 

@@ -30,3 +30,4 @@ __pycache__/
 scripts/anchored_docking_scripts.zip
 # Local scratch data
 yew_mun/
+AutoDock-GPU/

@@ -19,6 +19,11 @@ import pose_check  # noqa: E402
 import results  # noqa: E402
 DEFAULT_ADFR_PATH = os.path.join(REPO_DIR, ".pixi", "envs", "adfr")
 ADGPU_BINARY_NAMES = ("adgpu", "autodock_gpu_128wi", "autodock_gpu_64wi", "autodock_gpu_256wi")
+# AutoDock-GPU 1.5.3 is compiled for at most this many ligand atom types (MAX_NUM_OF_ATYPES in
+# common/defines.h). scripts/build_autodock_gpu.sh builds a copy with a higher limit and records it in a
+# file next to the binary.
+DEFAULT_ATOM_TYPE_LIMIT = 32
+ATOM_TYPE_LIMIT_FILE = "max_atom_types"
 
 
 def find_autodock_gpu(adg_path=None):
@@ -41,6 +46,37 @@ def find_autodock_gpu(adg_path=None):
         f"AutoDock-GPU binary not found in {where} (tried: {', '.join(ADGPU_BINARY_NAMES)}). "
         "On the HPC run: module load GCC/13.2.0 AutoDock-GPU/1.5.3-CUDA"
     )
+
+
+def atom_type_limit(adgpu_bin):
+    """How many ligand atom types this AutoDock-GPU binary supports.
+
+    A build made with scripts/build_autodock_gpu.sh has a file `max_atom_types` beside it; any other
+    binary (such as the cluster module) is the stock build.
+    """
+    try:
+        folders = {os.path.dirname(os.path.abspath(adgpu_bin)), os.path.dirname(os.path.realpath(adgpu_bin))}
+    except (TypeError, ValueError):
+        return DEFAULT_ATOM_TYPE_LIMIT
+    for folder in sorted(folders):
+        try:
+            with open(os.path.join(folder, ATOM_TYPE_LIMIT_FILE)) as fh:
+                value = int(fh.read().strip())
+        except (OSError, ValueError):
+            continue
+        if value >= DEFAULT_ATOM_TYPE_LIMIT:
+            return value
+    return DEFAULT_ATOM_TYPE_LIMIT
+
+
+def ligand_atom_types(pdbqt_path):
+    """The distinct AutoDock atom types in a ligand PDBQT: AutoDock-GPU refuses more than its limit."""
+    types = set()
+    with open(pdbqt_path) as fh:
+        for line in fh:
+            if line.startswith(("ATOM", "HETATM")):
+                types.add(line[77:80].strip() or line.split()[-1])
+    return types
 
 
 def find_autogrid(adg_path=None):
@@ -515,7 +551,19 @@ def run_docking(docking_dir, adgpu_bin, anchor_dict_list, new_atype2atype):
         "-T",
         t_options,
     ]
-    subprocess.run(adgpu_cmd, cwd=docking_dir, check=True)
+    process = subprocess.Popen(adgpu_cmd, cwd=docking_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, errors="replace", bufsize=1)
+    output = []
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        output.append(line)
+    code = process.wait()
+    if code != 0:
+        raise subprocess.CalledProcessError(code, adgpu_cmd)
+    # AutoDock-GPU exits with code 0 even when it stops on an error such as "Too many ligand atom types".
+    errors = [line.strip() for line in output if line.startswith("Error")]
+    if errors or not os.path.isfile(os.path.join(docking_dir, "ligand.dlg")):
+        raise LigandError(f"AutoDock-GPU stopped without a result: {errors[0] if errors else 'no output file'}")
 
 def export_results(docking_dir):
     export_cmd = ["mk_export.py", "ligand.dlg", "-s", "ligand_docked.sdf"]
@@ -594,7 +642,7 @@ def main():
         raise ValueError("Failed to load molecule files.")
 
     tools = {"adfr_path": adfr_path, "scripts_path": scripts_path, "adgpu_bin": adgpu_bin,
-             "autogrid_bin": autogrid_bin}
+             "autogrid_bin": autogrid_bin, "atom_type_limit": atom_type_limit(adgpu_bin)}
     prepare_view_files(args, adfr_path)
     rows = {}
     total = len(input_mols)
@@ -680,6 +728,57 @@ def prepare_view_files(args, adfr_path):
         shutil.copyfile(args.template_file, os.path.join(out, results.VIEW_TEMPLATE))
 
 
+def prepare_anchored_ligand(args, tools, template_mol, input_mol, docking_dir):
+    """Pick the anchors and write parameters.json and ligand.pdbqt, within AutoDock-GPU's atom-type limit.
+
+    The ligand's PDBQT has one atom type per anchor plus the ordinary types of its other atoms, and
+    AutoDock-GPU refuses more than its limit. In spread mode the number of anchors is reduced until the
+    ligand fits; in every other mode the ligand fails with an explanation. Returns
+    (search, anchor_dict_list, new_atype2atype, note), where the note says if anchors were dropped.
+    """
+    limit = tools.get("atom_type_limit", DEFAULT_ATOM_TYPE_LIMIT)
+    anchor_num, wanted = args.anchor_num, None
+    while True:
+        search = find_anchor_points(
+            template_mol,
+            input_mol,
+            anchor_num,
+            args.samples,
+            args.random_seed,
+            args.query_smarts,
+            args.anchor_indices,
+            args.anchor_mode,
+            args.verbose,
+        )
+        used = len(search.anchor_patterns)
+        wanted = used if wanted is None else wanted
+        with open(os.path.join(docking_dir, "anchor_positions.json"), "w") as f:
+            json.dump(search.anchor_positions, f, indent=4)
+        parameters, anchor_dict_list, new_atype2atype = generate_parameters_json(
+            tools["scripts_path"],
+            search.anchor_patterns,
+            search.pattern_mol,
+        )
+        with open(os.path.join(docking_dir, "parameters.json"), "w") as f:
+            json.dump(parameters, f, indent=4)
+        prepare_ligand(docking_dir, input_mol)
+        needed = len(ligand_atom_types(os.path.join(docking_dir, "ligand.pdbqt")))
+        if needed <= limit:
+            break
+        if args.anchor_mode == "spread" and not args.anchor_indices and used > 1:
+            anchor_num = max(1, used - max(1, needed - limit))
+            continue
+        raise LigandError(
+            f"The ligand needs {needed} AutoDock atom types ({used} anchors and {needed - used} others) but this "
+            f"AutoDock-GPU supports {limit}. Use fewer anchors, the spread mode (which lowers the number itself), "
+            "or an AutoDock-GPU built with a higher limit (scripts/build_autodock_gpu.sh).")
+    note = ""
+    if used < wanted:
+        note = (f"only {used} of {wanted} anchors could be used: more would exceed the {limit} atom types "
+                "that AutoDock-GPU supports")
+    return search, anchor_dict_list, new_atype2atype, note
+
+
 def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
     """Run the whole workflow for one ligand. Returns the pose check result."""
     # Calculate center of mass for the grid center
@@ -688,34 +787,9 @@ def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
     # Prepare boxsize.txt
     prepare_boxsize_file(docking_dir, args.size, center_of_mass)
 
-    # Find anchor points
-    search = find_anchor_points(
-        template_mol,
-        input_mol,
-        args.anchor_num,
-        args.samples,
-        args.random_seed,
-        args.query_smarts,
-        args.anchor_indices,
-        args.anchor_mode,
-        args.verbose,
-    )
-    with open(os.path.join(docking_dir, "anchor_positions.json"), "w") as f:
-        json.dump(search.anchor_positions, f, indent=4)
-
-    # Generate parameters.json
-    parameters, anchor_dict_list, new_atype2atype = generate_parameters_json(
-        tools["scripts_path"],
-        search.anchor_patterns,
-        search.pattern_mol,
-    )
-
-    # Save parameters.json
-    with open(os.path.join(docking_dir, "parameters.json"), "w") as f:
-        json.dump(parameters, f, indent=4)
-
-    # Prepare ligand.pdbqt
-    prepare_ligand(docking_dir, input_mol)
+    # Choose the anchors and prepare the ligand, within the atom-type limit of the AutoDock-GPU build
+    search, anchor_dict_list, new_atype2atype, limit_note = prepare_anchored_ligand(
+        args, tools, template_mol, input_mol, docking_dir)
 
     # Prepare receptor.pdbqt
     prepare_receptor(docking_dir, args.receptor_file, tools["adfr_path"], args.add_hydrogens)
@@ -742,7 +816,12 @@ def dock_ligand(args, tools, template_mol, input_mol, docking_dir):
     generate_pymol_session(docking_dir, args.template_file, args.receptor_file)
 
     # Check the pose against the anchoring
-    return check_docked_pose(docking_dir, template_mol, search)
+    checked = check_docked_pose(docking_dir, template_mol, search)
+    if limit_note:
+        checked["limit_note"] = limit_note
+        with open(os.path.join(docking_dir, "pose_check.json"), "w") as f:
+            json.dump(checked, f, indent=4)
+    return checked
 
 
 def check_docked_pose(docking_dir, template_mol, search):
@@ -767,7 +846,7 @@ def row_from_check(index, name, checked):
     return {"index": index, "name": name, "status": status,
             "anchor_max_dev": "" if checked.get("anchor_max") is None else checked["anchor_max"],
             "core_rmsd": "" if checked.get("core_rmsd") is None else checked["core_rmsd"],
-            "note": "; ".join(checked.get("problems", []))}
+            "note": "; ".join(checked.get("problems", []) + ([checked["limit_note"]] if checked.get("limit_note") else []))}
 
 
 def previous_row(index, name, docking_dir):
@@ -785,6 +864,8 @@ def describe_row(row):
     text = "docked"
     if row.get("anchor_max_dev") not in ("", None):
         text += f" (anchor deviation {row['anchor_max_dev']} A, core RMSD {row.get('core_rmsd', '')} A)"
+        if row.get("note"):
+            text += f"; {row['note']}"
     elif row.get("note"):
         text += f" ({row['note']})"
     return text

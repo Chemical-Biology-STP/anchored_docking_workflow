@@ -34,8 +34,9 @@ MIN_CORE_ATOMS = 6  # smaller than one ring: unlikely to be the same chemical se
 WATER_NAMES = {"HOH", "WAT", "H2O", "DOD", "TIP3", "SOL"}
 TOTAL_STEPS = 6
 
-# Limits compiled into the AutoDock-GPU 1.5.3 build used here (common/defines.h).
-MAX_ATOM_TYPES = 32        # MAX_NUM_OF_ATYPES
+# Limits compiled into the AutoDock-GPU 1.5.3 build of the cluster module (common/defines.h).
+MAX_ATOM_TYPES = 32        # MAX_NUM_OF_ATYPES; scripts/build_autodock_gpu.sh makes a build with a higher value
+CUSTOM_BUILD_GLOB = "adgpu_atypes*"   # folders in <repo>/bin written by that script
 MAX_GRID_POINTS = 256      # MAX_NUM_GRIDPOINTS
 # Largest box (Angstrom) for which grid_points() stays within MAX_GRID_POINTS.
 MAX_BOX_SIZE = 95.0
@@ -44,6 +45,8 @@ LARGE_BOX_SIZE = 40.0
 # Grid maps and other files for one ligand with the default 20 A box (measured on the example).
 MB_PER_LIGAND_20A = 30.0
 MB_PER_ANCHOR_20A = 1.3    # each anchor adds a grid map: 24 MB with 3 anchors, 41 MB with 17 on the example
+# A ligand with more usable anchor atoms than this may need more atom types than the module's AutoDock-GPU has.
+CUSTOM_BUILD_FROM_ANCHORS = MAX_ATOM_TYPES - 8
 MB_KEPT_PER_LIGAND = 1.0   # files kept per ligand when intermediates are deleted
 
 POLL_SECONDS = 10
@@ -235,19 +238,35 @@ def grid_points(size):
     return 2 * int(size / 0.75) + 1
 
 
-def standard_ligand_types():
-    """Number of ligand atom types AutoGrid makes maps for (read from scripts/write-gpf.py)."""
-    try:
-        with open(os.path.join(REPO_DIR, "scripts", "write-gpf.py"), errors="replace") as fh:
-            match = re.search(r"^ligand_types (.+)$", fh.read(), re.M)
-        return len(match.group(1).split())
-    except (OSError, AttributeError):
-        return 15
+def find_custom_build():
+    """The AutoDock-GPU build with the highest atom-type limit made by scripts/build_autodock_gpu.sh, or None.
+
+    Returns (folder, limit).
+    """
+    import anchored_docking as ad
+
+    best = None
+    for folder in glob.glob(os.path.join(REPO_DIR, "bin", CUSTOM_BUILD_GLOB)):
+        binary = next((os.path.join(folder, n) for n in ad.ADGPU_BINARY_NAMES
+                       if os.path.isfile(os.path.join(folder, n)) and os.access(os.path.join(folder, n), os.X_OK)), None)
+        if binary is None:
+            continue
+        limit = ad.atom_type_limit(binary)
+        if limit > MAX_ATOM_TYPES and (best is None or limit > best[1]):
+            best = (folder, limit)
+    return best
 
 
-def max_anchor_count():
-    """Each anchor adds one atom type to the maps, and AutoDock-GPU is built for MAX_ATOM_TYPES."""
-    return MAX_ATOM_TYPES - standard_ligand_types()
+def atom_type_limit(s=None):
+    """Atom types the AutoDock-GPU binary of this job supports."""
+    import anchored_docking as ad
+
+    if s is not None and s.adg_path:
+        for name in ad.ADGPU_BINARY_NAMES:
+            candidate = os.path.join(s.adg_path, name)
+            if os.path.isfile(candidate):
+                return ad.atom_type_limit(candidate)
+    return MAX_ATOM_TYPES
 
 
 def disk_per_ligand_mb(size, anchors=3):
@@ -634,6 +653,7 @@ class Settings:
     pixi_dir: str = ""
     ligands_used: str = ""
     add_hydrogens: bool = False
+    adg_path: str = ""          # folder of a custom AutoDock-GPU build with a higher atom-type limit
     protonated: object = None   # protein_prep.ProteinPrep when the wizard protonated the receptor
     original_receptor: str = ""  # the user's own receptor file, before protonation (separate-files route)
     template_view: str = ""     # the template with hydrogens, for display only (complex route)
@@ -657,6 +677,8 @@ def build_args(s):
             "--scripts_path", os.path.join(REPO_DIR, "scripts"),
             "--anchor_num", str(s.anchor_num), "--anchor_mode", s.anchor_mode,
             "--size", str(s.size), "--samples", str(s.samples)]
+    if s.adg_path:
+        args += ["--adg_path", s.adg_path]
     if s.query_smarts:
         args += ["--query_smarts", s.query_smarts]
     if s.anchor_indices:
@@ -1108,25 +1130,48 @@ def step_files(s):
     s.anchor_limit = min((r.anchors for r in s.kept if r.anchors), default=0)
 
 
+def offer_custom_build(s):
+    """If some ligand has so many usable anchor atoms that the module's AutoDock-GPU may not fit them all,
+    offer a build with a higher atom-type limit (made by scripts/build_autodock_gpu.sh) when one exists."""
+    biggest = max((r.anchors for r in s.kept if r.anchors), default=0)
+    build = find_custom_build()
+    if biggest <= CUSTOM_BUILD_FROM_ANCHORS:
+        return
+    if build is None:
+        note(f"A ligand has {biggest} usable anchor atoms. The cluster's AutoDock-GPU supports {MAX_ATOM_TYPES} atom types, "
+             "so it may have to use fewer anchors for that ligand (the results table says when). "
+             "scripts/build_autodock_gpu.sh builds a version with a higher limit.")
+        return
+    folder, limit = build
+    say(f"\n  A ligand has {biggest} usable anchor atoms, and a custom AutoDock-GPU with a limit of {limit} atom types")
+    say(f"  (instead of {MAX_ATOM_TYPES}) is available in {folder}.")
+    note("It was built for A100 GPUs (the ga100 partition) only.")
+    if ask_yes_no("Use the custom AutoDock-GPU?", True):
+        s.adg_path = folder
+
+
 def step_settings(s):
     heading(4, "Docking settings")
     usable = s.anchor_limit
-    cap = max_anchor_count()
-    default_anchors = min(3, usable, cap) if usable else 3   # for the random mode
+    offer_custom_build(s)
+    limit = atom_type_limit(s)
+    default_anchors = min(3, usable, limit - 1) if usable else 3   # for the random mode
     say("  Anchors are atoms of the shared core (the maximum common substructure of each ligand and the")
     say("  template) that are pulled towards the template position.")
     if usable and usable < 3:
         warn(f"Only {usable} usable anchor atom(s) in the weakest ligand: the core will be held loosely there.")
     if usable:
-        counts = [min(r.anchors, cap) for r in s.kept if r.anchors]
+        counts = [r.anchors for r in s.kept if r.anchors]
         used = f"{min(counts)}" if min(counts) == max(counts) else f"{min(counts)} to {max(counts)}"
-        say(f"\n  Recommended: {used} anchors per ligand, spread across the shared core (as many as the shared core")
-        say(f"  allows, at most {cap}), 20 A search box.")
+        say(f"\n  Recommended: every usable core atom as an anchor ({used} per ligand), chosen to be spread across the")
+        say("  shared core, 20 A search box.")
     else:
-        say(f"\n  Recommended: up to {cap} anchors spread across the shared core, 20 A search box.")
-    s.anchor_mode, s.anchor_num = "spread", cap
+        say("\n  Recommended: every usable core atom as an anchor, spread across the shared core, 20 A search box.")
+    say(f"  AutoDock-GPU supports {limit} atom types in all (each anchor is one, and so are the types of the other")
+    say("  atoms). A ligand that would need more gets fewer anchors, and the results table says so.")
+    s.anchor_mode, s.anchor_num = "spread", limit
     if not ask_yes_no("Use the recommended docking settings?", True):
-        say("  'spread' uses as many anchors as you allow, always the ones furthest apart from each other, so")
+        say("  'spread' uses up to the number of anchors you allow, always the ones furthest apart from each other, so")
         say("  the whole core is held in place. 'random' picks a number of anchors at random. 'area' tries many")
         say("  random sets and keeps the three that are furthest apart (always exactly 3 anchors).")
         s.anchor_mode = ask_choice("Anchor selection", ["spread", "random", "area"], "spread")
@@ -1134,18 +1179,16 @@ def step_settings(s):
             warn("The 'area' mode needs at least 3 usable anchors; using 'random' instead.")
             s.anchor_mode = "random"
         if s.anchor_mode == "spread":
-            say(f"\n  At most {cap} anchors are possible: each one adds an atom type, and the "
-                f"AutoDock-GPU build here supports {MAX_ATOM_TYPES}. A ligand whose core has fewer usable")
-            say("  atoms than the number you give uses all of them.")
-            s.anchor_num = ask_number("Maximum number of anchor atoms", cap, int, 1, maximum=cap)
+            say("\n  A ligand whose core has fewer usable atoms than the number you give uses all of them.")
+            s.anchor_num = ask_number("Maximum number of anchor atoms", limit, int, 1, maximum=limit)
         elif s.anchor_mode == "area":
             s.anchor_num = 3
             say("\n  More random attempts find a better-spread set of anchors but take longer.")
             s.samples = ask_number("Number of random attempts", 100, int, 1)
         else:
-            say(f"\n  At most {cap} anchors are possible: each one adds an atom type, and the "
-                f"AutoDock-GPU build here supports {MAX_ATOM_TYPES}.")
-            s.anchor_num = ask_number("Number of anchor atoms", default_anchors, int, 1, maximum=cap)
+            say(f"\n  Each anchor adds an atom type and AutoDock-GPU supports {limit}, so a ligand with many anchors")
+            say("  and many other atom types can exceed it; that ligand then fails with an explanation.")
+            s.anchor_num = ask_number("Number of anchor atoms", default_anchors, int, 1, maximum=limit - 1)
             if usable and s.anchor_num > usable:
                 warn(f"The weakest ligand has only {usable} usable anchor atom(s); the job will fail on it.")
         say("\n  The search box is the region around the template where the ligand may move.")

@@ -82,8 +82,8 @@ pixi run python anchored_docking.py \
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--anchor_num` | `3` | Number of anchor points to use. In `spread` mode it is a maximum: a ligand whose core has fewer usable atoms uses all of them. `0` uses every usable atom, which fails in AutoDock-GPU above 17 |
-| `--anchor_mode` | `random` | Anchor selection mode: `random`, `area` (always 3 anchors, maximising triangle area) or `spread` (up to `--anchor_num` core atoms that are as far apart from each other as possible; deterministic, no seed needed). The `pixi run dock` wizard recommends `spread` with the maximum of 17 |
+| `--anchor_num` | `3` | Number of anchor points to use. In `spread` mode it is a maximum: a ligand whose core has fewer usable atoms uses all of them. `0` uses every usable atom, which fails for a ligand that would need more atom types than AutoDock-GPU supports |
+| `--anchor_mode` | `random` | Anchor selection mode: `random`, `area` (always 3 anchors, maximising triangle area) or `spread` (up to `--anchor_num` core atoms that are as far apart from each other as possible; deterministic, no seed needed). The `pixi run dock` wizard recommends `spread` with the atom-type limit as the maximum, so every usable core atom is used where AutoDock-GPU allows it |
 | `--query_smarts` | `None` | Manually specify a SMARTS pattern for the common substructure instead of using MCS |
 | `--anchor_indices` | `None` | Specify exact anchor atom indices (0-based) within the query SMARTS. Requires `--query_smarts` |
 | `--size` | `20.0` | Size of the docking box in Angstroms |
@@ -102,7 +102,7 @@ pixi run python anchored_docking.py \
 ## How it works
 
 1. Finds the maximum common substructure (MCS) between the template and input ligand (or uses a user-provided SMARTS)
-2. Selects anchor atoms — unique, non-equivalent heavy atoms in the common core (atoms with a symmetric twin are never used, because their mapping to the template is ambiguous). Each anchor needs its own atom type and AutoDock-GPU 1.5.3 supports 32 in total, so at most 17 anchors are possible; a larger core cannot be anchored atom by atom, which is what `spread` mode is for
+2. Selects anchor atoms — unique, non-equivalent heavy atoms in the common core (atoms with a symmetric twin are never used, because their mapping to the template is ambiguous). Each anchor needs its own atom type, and AutoDock-GPU 1.5.3 supports 32 atom types per ligand in total, counting the anchors **and** the ordinary types of the ligand's other atoms. How many anchors fit therefore depends on the ligand (22 for a 26-atom example, 29 for a 46-atom one). In `spread` mode the script lowers the number of anchors until the ligand fits and says so in the results; in the other modes such a ligand fails with an explanation. A build with a higher limit lifts this (see [below](#autodock-gpu-with-a-higher-atom-type-limit))
 3. Generates custom atom types for anchor atoms and writes a Meeko parameters file
 4. Prepares the ligand (PDBQT via Meeko) and receptor (PDBQT via ADFR)
 5. Runs AutoGrid to generate grid maps
@@ -135,6 +135,21 @@ A ligand whose 3D coordinates cannot be generated is reported as failed. Earlier
 - **Heavy atoms can move.** PDB2PQR flips Asn, Gln and His side chains when that improves hydrogen bonds (on the 1M17 test protein, two residues changed; the largest shift in a plain Bace1 run was 2.4 Å). Flipped residues are listed in the report.
 - The result is saved as `<job>_receptor.pdb` with `<job>_protonation_report.txt` (states, pKa values near the template, flips, rebuilt atoms, gaps). If PDB2PQR fails, or the user declines, the CLI offers ADFR's rule-based hydrogens (`--add_hydrogens`), which make every histidine cationic.
 - A kept ion or cofactor passes through PDB2PQR unchanged and gets no hydrogens.
+
+## AutoDock-GPU with a higher atom-type limit
+
+The AutoDock-GPU module here is compiled for 32 atom types per ligand (`MAX_NUM_OF_ATYPES` in `common/defines.h`). A ligand needs one type per anchor plus the types of its other atoms, so a core of about 30 usable atoms can exceed it. The stock binary then stops with `Too many ligand atom types (more than 32)`. (AutoDock-GPU itself exits with code 0 after that error; the script now catches it.)
+
+`scripts/build_autodock_gpu.sh` builds a copy of an AutoDock-GPU source tree with a higher limit and leaves the source untouched:
+
+```bash
+scripts/build_autodock_gpu.sh /path/to/AutoDock-GPU 64
+```
+
+- It needs the CUDA and GCC modules. The defaults are `CUDA/12.1.1` and `GCC/12.3.0`, because CUDA 12.1 rejects GCC 13. It takes a few minutes and does not need a GPU.
+- It builds for compute capability 80 (the A100 GPUs of `ga100`) unless `TARGETS` is set, with 128 work-items like the module. The result is in `bin/adgpu_atypes64/`, together with a `max_atom_types` file.
+- Use it with `--adg_path bin/adgpu_atypes64`. The script reads the limit from that file; `pixi run dock` offers the build when a ligand has more than 24 usable anchor atoms.
+- Tested on the A100 nodes: a 30-anchor ligand fails on the module's binary and docks with the 64-type build. Nothing else was changed in the AutoDock-GPU source, and for a ligand that fits 32 types the two binaries gave the same result in the one comparison made (free energy −9.32 against −9.33 kcal/mol, same anchors, same pose check).
 
 ## Output
 
@@ -190,7 +205,7 @@ pixi run dock
 - **Ligands:** runs the same core and anchor search the docking uses on every ligand, tries the same 3D embedding, and flags ligands with no or a tiny shared core, no 3D geometry, several fragments (salts), or atoms AutoDock has no atom type for. Flagged ligands can be left out before the job starts.
 - **Earlier runs:** if the output folder holds a previous run with identical inputs and settings, you can resume it so finished ligands are skipped. If anything differs, resuming is refused and the reason is shown.
 - **Results:** the final table shows each ligand's status, the pose check numbers, and the reason for any failure, instead of only whether a file exists.
-- **Settings:** the anchor count (at most 17, from AutoDock-GPU's 32 atom types), box size (at most 95 Å, from its 256 grid points), random seed (0 or higher) and time limit are range-checked. Manual core patterns are validated against the template.
+- **Settings:** the anchor count (limited by AutoDock-GPU's 32 atom types, shared with the ligand's other atom types), box size (at most 95 Å, from its 256 grid points), random seed (0 or higher) and time limit are range-checked. Manual core patterns are validated against the template.
 - **Resources:** warns when the estimated disk use is large, refuses unwritable or dangerous output folders, and requires the ADFRsuite environment (`pixi install --all`) before starting.
 
 It then asks how to run:

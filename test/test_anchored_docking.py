@@ -6,6 +6,7 @@ workflow is replaced by a stub, so these tests need no GPU.
 
 import json
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -405,3 +406,184 @@ def test_spread_mode_uses_every_usable_atom_when_the_core_is_smaller_than_the_re
 
 def test_spread_is_a_valid_mode_and_part_of_the_resume_signature():
     assert ad.signature_differences(signature(), signature(anchor_mode="spread")) == ["anchor_mode"]
+
+
+# --------------------------------------------------------------------------
+# AutoDock-GPU's atom-type limit
+# --------------------------------------------------------------------------
+
+
+def fake_binary(folder, limit=None, name="autodock_gpu_128wi"):
+    folder.mkdir(parents=True, exist_ok=True)
+    binary = folder / name
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    if limit is not None:
+        (folder / ad.ATOM_TYPE_LIMIT_FILE).write_text(f"{limit}\n")
+    return str(binary)
+
+
+def test_a_stock_binary_has_the_stock_atom_type_limit(tmp_path):
+    assert ad.atom_type_limit(fake_binary(tmp_path / "stock")) == ad.DEFAULT_ATOM_TYPE_LIMIT == 32
+
+
+def test_a_custom_build_states_its_limit_beside_the_binary(tmp_path):
+    assert ad.atom_type_limit(fake_binary(tmp_path / "custom", 64)) == 64
+
+
+def test_the_limit_is_found_through_a_symlink(tmp_path):
+    real = fake_binary(tmp_path / "custom", 48)
+    link = tmp_path / "bin" / "adgpu"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    assert ad.atom_type_limit(str(link)) == 48
+
+
+@pytest.mark.parametrize("content", ["not a number", "", "16", "-5"])
+def test_an_unusable_limit_file_falls_back_to_the_stock_limit(tmp_path, content):
+    binary = fake_binary(tmp_path / "odd")
+    (tmp_path / "odd" / ad.ATOM_TYPE_LIMIT_FILE).write_text(content)
+    assert ad.atom_type_limit(binary) == 32
+
+
+def test_ligand_atom_types_are_read_from_the_pdbqt(tmp_path):
+    pdbqt = tmp_path / "ligand.pdbqt"
+    pdbqt.write_text(
+        "ROOT\n"
+        "ATOM      1  C01 UNL     1       0.000   0.000   0.000  0.00  0.00    +0.000 A00\n"
+        "ATOM      2  C02 UNL     1       1.000   0.000   0.000  0.00  0.00    +0.000 C \n"
+        "HETATM    3  O03 UNL     1       2.000   0.000   0.000  0.00  0.00    -0.300 OA\n"
+        "ATOM      4  H04 UNL     1       3.000   0.000   0.000  0.00  0.00    +0.200 HD\n"
+        "ATOM      5  C05 UNL     1       4.000   0.000   0.000  0.00  0.00    +0.000 C \n"
+        "ENDROOT\nTORSDOF 0\n")
+    assert ad.ligand_atom_types(str(pdbqt)) == {"A00", "C", "OA", "HD"}
+
+
+def script_that(tmp_path, body):
+    path = tmp_path / "fake_adgpu.sh"
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_an_error_printed_by_autodock_gpu_is_reported_even_with_exit_code_zero(tmp_path):
+    """AutoDock-GPU stops with 'Too many ligand atom types' but still exits with 0; without this the run
+    only failed later, in mk_export.py, hiding the cause."""
+    binary = script_that(tmp_path, "echo 'Error: Too many ligand atom types (more than 32).'\n")
+    with pytest.raises(ad.LigandError, match="Too many ligand atom types"):
+        ad.run_docking(str(tmp_path), binary, [], {})
+
+
+def test_a_missing_result_file_is_reported(tmp_path):
+    with pytest.raises(ad.LigandError, match="no output file"):
+        ad.run_docking(str(tmp_path), script_that(tmp_path, "echo working\n"), [], {})
+
+
+def test_a_successful_run_passes_and_its_output_is_shown(tmp_path, capsys):
+    binary = script_that(tmp_path, "echo progress line\ntouch ligand.dlg\n")
+    ad.run_docking(str(tmp_path), binary, [], {})
+    assert "progress line" in capsys.readouterr().out
+
+
+def test_a_failing_exit_code_is_still_an_error(tmp_path):
+    with pytest.raises(subprocess.CalledProcessError):
+        ad.run_docking(str(tmp_path), script_that(tmp_path, "exit 3\n"), [], {})
+
+
+needs_meeko = pytest.mark.skipif(shutil.which("mk_prepare_ligand.py") is None,
+                                 reason="Meeko is not on PATH (run the tests through pixi)")
+
+
+def prepare_with_limit(tmp_path, limit, mode="spread", number=22, indices=None):
+    """The real anchor choice and Meeko preparation for the crystal ligand docked onto itself (22 usable anchors)."""
+    import argparse
+
+    template = Chem.SDMolSupplier(TEMPLATE)[0]
+    args = argparse.Namespace(anchor_num=number, samples=100, random_seed=None, query_smarts=None,
+                              anchor_indices=indices, anchor_mode=mode, verbose=False)
+    tools = {"scripts_path": os.path.join(REPO, "scripts"), "atom_type_limit": limit}
+    result = ad.prepare_anchored_ligand(args, tools, template, template, str(tmp_path))
+    return result, ad.ligand_atom_types(str(tmp_path / "ligand.pdbqt"))
+
+
+@needs_meeko
+def test_all_anchors_are_used_when_the_ligand_fits(tmp_path):
+    (search, _, _, note), types = prepare_with_limit(tmp_path, 32)
+    assert len(search.anchor_patterns) == 22 and note == "" and len(types) <= 32
+
+
+@needs_meeko
+def test_spread_mode_drops_anchors_until_the_ligand_fits(tmp_path):
+    (search, anchors, mapping, note), types = prepare_with_limit(tmp_path, 20)
+    assert len(types) <= 20
+    assert 1 <= len(search.anchor_patterns) < 22
+    assert len(anchors) == len(mapping) == len(search.anchor_patterns)
+    assert f"only {len(search.anchor_patterns)} of 22 anchors" in note and "20 atom types" in note
+    # the files on disk are those of the final choice, not of the first attempt
+    assert len(json.load(open(tmp_path / "anchor_positions.json"))) == len(search.anchor_patterns)
+    base = json.load(open(os.path.join(REPO, "scripts", "base_parameters.json")))["ad4"]
+    assert len(json.load(open(tmp_path / "parameters.json"))["ad4"]) - len(base) == len(search.anchor_patterns)
+
+
+@needs_meeko
+def test_a_ligand_that_needs_exactly_the_limit_keeps_all_its_anchors(tmp_path):
+    for folder in ("probe", "exact", "less"):
+        (tmp_path / folder).mkdir()
+    _, types = prepare_with_limit(tmp_path / "probe", 100)        # all 22 anchors: how many types do they need?
+    needed = len(types)
+    (search, _, _, note), _ = prepare_with_limit(tmp_path / "exact", needed)
+    assert len(search.anchor_patterns) == 22 and note == ""
+    (reduced, _, _, note), _ = prepare_with_limit(tmp_path / "less", needed - 1)
+    assert len(reduced.anchor_patterns) < 22 and note
+
+
+@needs_meeko
+def test_the_number_of_anchors_is_lowered_by_the_excess_not_one_at_a_time(tmp_path, monkeypatch):
+    calls = []
+    real = ad.prepare_ligand
+    monkeypatch.setattr(ad, "prepare_ligand", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    prepare_with_limit(tmp_path, 14)                 # 22 anchors asked for, far more than fit
+    assert len(calls) <= 6                            # measured: 4; one at a time would take more than a dozen
+
+
+@needs_meeko
+@pytest.mark.parametrize("mode, number, limit", [("random", 22, 14), ("area", 3, 4)])
+def test_other_modes_fail_with_an_explanation_instead(tmp_path, mode, number, limit):
+    with pytest.raises(ad.LigandError, match="atom types.*spread mode"):
+        prepare_with_limit(tmp_path, limit, mode=mode, number=number)
+
+
+@needs_meeko
+def test_a_ligand_that_cannot_fit_even_one_anchor_fails(tmp_path):
+    with pytest.raises(ad.LigandError, match="atom types"):
+        prepare_with_limit(tmp_path, 2)
+
+
+@needs_meeko
+def test_a_higher_limit_allows_the_full_set_where_the_stock_limit_does_not(tmp_path):
+    big = Chem.MolFromSmiles("CC1=C(C(=CC=C1)C)OCC(=O)NC(CC2=CC=CC=C2)C(CC(CC3=CC=CC=C3)NC(=O)C(C(C)C)N4CCCNC4=O)O")
+    big = Chem.AddHs(big)
+    from rdkit.Chem import AllChem
+    AllChem.EmbedMolecule(big, randomSeed=3)
+    import argparse
+    args = argparse.Namespace(anchor_num=64, samples=100, random_seed=None, query_smarts=None,
+                              anchor_indices=None, anchor_mode="spread", verbose=False)
+    scripts = os.path.join(REPO, "scripts")
+    stock, custom = tmp_path / "stock", tmp_path / "custom"
+    stock.mkdir()
+    custom.mkdir()
+    _, _, _, stock_note = ad.prepare_anchored_ligand(args, {"scripts_path": scripts, "atom_type_limit": 32}, big, big, str(stock))
+    search, _, _, custom_note = ad.prepare_anchored_ligand(args, {"scripts_path": scripts, "atom_type_limit": 64}, big, big, str(custom))
+    assert "only" in stock_note and custom_note == ""             # 30 usable anchors do not fit 32 types, but fit 64
+    assert len(search.anchor_patterns) == 30
+    assert len(ad.ligand_atom_types(str(stock / "ligand.pdbqt"))) <= 32
+
+
+def test_a_note_about_dropped_anchors_reaches_the_summary_and_the_log_line():
+    checked = {"ok": True, "problems": [], "anchor_max": 0.9, "core_rmsd": 0.6,
+               "limit_note": "only 20 of 22 anchors could be used"}
+    row = ad.row_from_check(0, "x", checked)
+    assert row["status"] == "docked" and row["note"] == "only 20 of 22 anchors could be used"
+    assert "anchor deviation 0.9 A" in ad.describe_row(row) and "only 20 of 22 anchors" in ad.describe_row(row)
+    plain = ad.row_from_check(0, "x", {"ok": True, "problems": [], "anchor_max": 0.9, "core_rmsd": 0.6})
+    assert plain["note"] == "" and ad.describe_row(plain).endswith("core RMSD 0.6 A)")

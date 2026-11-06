@@ -510,7 +510,7 @@ def test_complex_flow_resumes_a_matching_earlier_run(monkeypatch, tmp_path, caps
     out.mkdir()
     import json
     (out / "run_settings.json").write_text(json.dumps(
-        ad.run_signature(str(saved_template), LIGAND, str(saved_receptor), d.max_anchor_count(), "spread", 20.0, 100,
+        ad.run_signature(str(saved_template), LIGAND, str(saved_receptor), d.MAX_ATOM_TYPES, "spread", 20.0, 100,
                          None, None, None)))
     (out / "0").mkdir()
     (out / "0" / "ligand_docked.sdf").write_text("x")
