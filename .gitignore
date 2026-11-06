@@ -28,3 +28,5 @@ __pycache__/
 
 # Archives
 scripts/anchored_docking_scripts.zip
+# Local scratch data
+yew_mun/
