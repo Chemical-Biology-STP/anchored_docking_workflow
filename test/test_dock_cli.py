@@ -271,6 +271,25 @@ def test_anchor_limit_follows_the_atom_type_limit():
     assert d.max_anchor_count() >= 3
 
 
+def test_disk_estimate_grows_with_the_number_of_anchors():
+    assert d.estimate_disk_mb(10, 20.0, False, 17) > d.estimate_disk_mb(10, 20.0, False, 3)
+    assert d.estimate_disk_mb(10, 20.0, False) == d.estimate_disk_mb(10, 20.0, False, 3)
+    # measured on the Bace1 example: 24 MB with 3 anchors, 41 MB with 17 (the estimate is a bit generous)
+    assert 30 <= d.disk_per_ligand_mb(20.0, 3) <= 40 and 41 <= d.disk_per_ligand_mb(20.0, 17) <= 60
+
+
+def test_anchors_in_use_follow_the_mode_and_the_smallest_core():
+    class Ligand:
+        def __init__(self, anchors):
+            self.anchors = anchors
+
+    spread = d.Settings(anchor_mode="spread", anchor_num=17, kept=[Ligand(12), Ligand(25)])
+    assert d.anchors_in_use(spread) == 17                      # the larger core is limited to 17
+    assert d.anchors_in_use(d.Settings(anchor_mode="spread", anchor_num=17, kept=[Ligand(6), Ligand(9)])) == 9
+    assert d.anchors_in_use(d.Settings(anchor_mode="area", anchor_num=3, kept=[])) == 3
+    assert d.anchors_in_use(d.Settings(anchor_mode="random", anchor_num=5, kept=[])) == 5
+
+
 def test_disk_estimate_scales_with_box_volume_and_cleaning():
     assert d.estimate_disk_mb(10, 40.0, False) == pytest.approx(8 * d.estimate_disk_mb(10, 20.0, False))
     assert d.estimate_disk_mb(100, 20.0, True) < d.estimate_disk_mb(100, 20.0, False)
@@ -562,8 +581,9 @@ def old_run(tmp_path, done=1, **changes):
     """A folder holding an earlier run of the example, with `done` ligands finished."""
     out = tmp_path / "output"
     out.mkdir()
-    values = dict(template_file=TEMPLATE, input_file=LIGAND, receptor_file=RECEPTOR, anchor_num=3,
-                  anchor_mode="random", size=20.0, samples=100, random_seed=None, query_smarts=None,
+    values = dict(template_file=TEMPLATE, input_file=LIGAND, receptor_file=RECEPTOR,
+                  anchor_num=d.max_anchor_count(),
+                  anchor_mode="spread", size=20.0, samples=100, random_seed=None, query_smarts=None,
                   anchor_indices=None)
     values.update(changes)
     (out / "run_settings.json").write_text(json.dumps(ad.run_signature(**values)))
@@ -681,9 +701,31 @@ def test_wizard_saves_a_job_script_for_the_example(monkeypatch, tmp_path, capsys
     script = (tmp_path / "submit_dock_CAT-13f.sh").read_text()
     assert f"--docking_dir {out}" in script
     assert f"--receptor_file {RECEPTOR}" in script
-    assert "--anchor_num 3" in script and "--anchor_mode random" in script
+    assert f"--anchor_num {d.max_anchor_count()}" in script and "--anchor_mode spread" in script
     assert "Job script saved" in capsys.readouterr().out
     assert not out.exists()  # saving a script must not run anything
+
+
+def test_wizard_recommends_spreading_anchors_over_the_whole_core(monkeypatch, tmp_path, capsys):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "", "", ""])
+    text = capsys.readouterr().out
+    assert "spread across the shared core" in text and f"at most {d.max_anchor_count()}" in text
+    assert "up to" in text and "per ligand, spread across the shared core" in text      # the review table
+
+
+def test_wizard_asks_for_a_maximum_in_spread_mode_and_no_seed(monkeypatch, tmp_path, capsys):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND,
+                             "no",                  # not the recommended settings
+                             "",                    # anchor selection: spread (default)
+                             "99", "5",             # too many, then fine
+                             "",                    # box size
+                             "",                    # expert options: no (a seed is not asked for in spread mode)
+                             "",                    # clean intermediates
+                             save_choice(), str(tmp_path / "o"), "", "", "", ""])
+    text = capsys.readouterr().out
+    assert "uses all of them" in text and "random seed makes" not in text       # the prompt text itself is not captured
+    script = (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+    assert "--anchor_num 5" in script and "--anchor_mode spread" in script and "--random_seed" not in script
 
 
 def test_wizard_leaves_out_flagged_ligands_and_validates_expert_input(monkeypatch, tmp_path, capsys):

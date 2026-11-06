@@ -82,8 +82,8 @@ pixi run python anchored_docking.py \
 
 | Parameter | Default | Description |
 |---|---|---|
-| `--anchor_num` | `3` | Number of anchor points to use |
-| `--anchor_mode` | `random` | Anchor selection mode: `random` or `area` (area always uses 3 anchors, maximising triangle area) |
+| `--anchor_num` | `3` | Number of anchor points to use. In `spread` mode it is a maximum: a ligand whose core has fewer usable atoms uses all of them. `0` uses every usable atom, which fails in AutoDock-GPU above 17 |
+| `--anchor_mode` | `random` | Anchor selection mode: `random`, `area` (always 3 anchors, maximising triangle area) or `spread` (up to `--anchor_num` core atoms that are as far apart from each other as possible; deterministic, no seed needed). The `pixi run dock` wizard recommends `spread` with the maximum of 17 |
 | `--query_smarts` | `None` | Manually specify a SMARTS pattern for the common substructure instead of using MCS |
 | `--anchor_indices` | `None` | Specify exact anchor atom indices (0-based) within the query SMARTS. Requires `--query_smarts` |
 | `--size` | `20.0` | Size of the docking box in Angstroms |
@@ -102,7 +102,7 @@ pixi run python anchored_docking.py \
 ## How it works
 
 1. Finds the maximum common substructure (MCS) between the template and input ligand (or uses a user-provided SMARTS)
-2. Selects anchor atoms — unique, non-equivalent heavy atoms in the common core
+2. Selects anchor atoms — unique, non-equivalent heavy atoms in the common core (atoms with a symmetric twin are never used, because their mapping to the template is ambiguous). Each anchor needs its own atom type and AutoDock-GPU 1.5.3 supports 32 in total, so at most 17 anchors are possible; a larger core cannot be anchored atom by atom, which is what `spread` mode is for
 3. Generates custom atom types for anchor atoms and writes a Meeko parameters file
 4. Prepares the ligand (PDBQT via Meeko) and receptor (PDBQT via ADFR)
 5. Runs AutoGrid to generate grid maps

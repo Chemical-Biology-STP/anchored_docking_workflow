@@ -43,6 +43,7 @@ MAX_BOX_SIZE = 95.0
 LARGE_BOX_SIZE = 40.0
 # Grid maps and other files for one ligand with the default 20 A box (measured on the example).
 MB_PER_LIGAND_20A = 30.0
+MB_PER_ANCHOR_20A = 1.3    # each anchor adds a grid map: 24 MB with 3 anchors, 41 MB with 17 on the example
 MB_KEPT_PER_LIGAND = 1.0   # files kept per ligand when intermediates are deleted
 
 POLL_SECONDS = 10
@@ -249,8 +250,21 @@ def max_anchor_count():
     return MAX_ATOM_TYPES - standard_ligand_types()
 
 
-def estimate_disk_mb(n_ligands, size, clean):
-    per_ligand = MB_PER_LIGAND_20A * (size / 20.0) ** 3
+def disk_per_ligand_mb(size, anchors=3):
+    """Intermediate files for one ligand: every anchor adds one grid map."""
+    return (MB_PER_LIGAND_20A + MB_PER_ANCHOR_20A * (anchors - 3)) * (size / 20.0) ** 3
+
+
+def anchors_in_use(s):
+    """The most anchors any ligand will get."""
+    if s.anchor_mode == "spread":
+        most = max((r.anchors for r in s.kept if r.anchors), default=s.anchor_num)
+        return min(s.anchor_num, most)
+    return 3 if s.anchor_mode == "area" else s.anchor_num
+
+
+def estimate_disk_mb(n_ligands, size, clean, anchors=3):
+    per_ligand = disk_per_ligand_mb(size, anchors)
     if clean:
         return per_ligand + n_ligands * MB_KEPT_PER_LIGAND  # peak for one ligand plus what is kept
     return per_ligand * n_ligands
@@ -1098,21 +1112,33 @@ def step_settings(s):
     heading(4, "Docking settings")
     usable = s.anchor_limit
     cap = max_anchor_count()
-    default_anchors = min(3, usable, cap) if usable else 3
-    say("  Anchors are atoms of the shared core that are pulled towards the template position.")
+    default_anchors = min(3, usable, cap) if usable else 3   # for the random mode
+    say("  Anchors are atoms of the shared core (the maximum common substructure of each ligand and the")
+    say("  template) that are pulled towards the template position.")
     if usable and usable < 3:
-        warn(f"Only {usable} usable anchor atom(s) in the weakest ligand, so {default_anchors} will be used.")
-    say(f"\n  Recommended: {default_anchors} anchor(s), random choice, 20 A search box.")
-    if ask_yes_no("Use the recommended docking settings?", True):
-        s.anchor_num = default_anchors
+        warn(f"Only {usable} usable anchor atom(s) in the weakest ligand: the core will be held loosely there.")
+    if usable:
+        counts = [min(r.anchors, cap) for r in s.kept if r.anchors]
+        used = f"{min(counts)}" if min(counts) == max(counts) else f"{min(counts)} to {max(counts)}"
+        say(f"\n  Recommended: {used} anchors per ligand, spread across the shared core (as many as the shared core")
+        say(f"  allows, at most {cap}), 20 A search box.")
     else:
-        say("  'random' picks anchors at random. 'area' tries many random sets and keeps the")
-        say("  three that are spread furthest apart (always uses exactly 3 anchors).")
-        s.anchor_mode = ask_choice("Anchor selection", ["random", "area"], "random")
+        say(f"\n  Recommended: up to {cap} anchors spread across the shared core, 20 A search box.")
+    s.anchor_mode, s.anchor_num = "spread", cap
+    if not ask_yes_no("Use the recommended docking settings?", True):
+        say("  'spread' uses as many anchors as you allow, always the ones furthest apart from each other, so")
+        say("  the whole core is held in place. 'random' picks a number of anchors at random. 'area' tries many")
+        say("  random sets and keeps the three that are furthest apart (always exactly 3 anchors).")
+        s.anchor_mode = ask_choice("Anchor selection", ["spread", "random", "area"], "spread")
         if s.anchor_mode == "area" and usable and usable < 3:
             warn("The 'area' mode needs at least 3 usable anchors; using 'random' instead.")
             s.anchor_mode = "random"
-        if s.anchor_mode == "area":
+        if s.anchor_mode == "spread":
+            say(f"\n  At most {cap} anchors are possible: each one adds an atom type, and the "
+                f"AutoDock-GPU build here supports {MAX_ATOM_TYPES}. A ligand whose core has fewer usable")
+            say("  atoms than the number you give uses all of them.")
+            s.anchor_num = ask_number("Maximum number of anchor atoms", cap, int, 1, maximum=cap)
+        elif s.anchor_mode == "area":
             s.anchor_num = 3
             say("\n  More random attempts find a better-spread set of anchors but take longer.")
             s.samples = ask_number("Number of random attempts", 100, int, 1)
@@ -1124,8 +1150,9 @@ def step_settings(s):
                 warn(f"The weakest ligand has only {usable} usable anchor atom(s); the job will fail on it.")
         say("\n  The search box is the region around the template where the ligand may move.")
         s.size = ask_number("Search box size in Angstrom", 20.0, float, 1.0, maximum=MAX_BOX_SIZE)
-        say("\n  A random seed makes the anchor choice repeatable. Leave blank for none.")
-        s.seed = ask_number("Random seed (0 or higher)", None, int, 0, required=False)
+        if s.anchor_mode != "spread":  # spread has no random element
+            say("\n  A random seed makes the anchor choice repeatable. Leave blank for none.")
+            s.seed = ask_number("Random seed (0 or higher)", None, int, 0, required=False)
         if ask_yes_no("Show expert options (manual core pattern, debug output)?", False):
             expert_options(s)
     if s.size <= s.extent:
@@ -1135,7 +1162,7 @@ def step_settings(s):
         warn(f"A {s.size} A box is large: grid generation time and disk use grow with the cube of the size "
              f"(about {(s.size / 20.0) ** 3:.0f}x the default 20 A box).")
     many = len(s.kept) >= 10
-    per_ligand = MB_PER_LIGAND_20A * (s.size / 20.0) ** 3
+    per_ligand = disk_per_ligand_mb(s.size, anchors_in_use(s))
     say(f"\n  Intermediate files (grid maps etc.) take about {per_ligand:.0f} MB per ligand at this box size.")
     say("  Deleting them keeps only the docked poses, the template and the receptor.")
     s.clean = ask_yes_no("Delete intermediate files when each ligand is done?", many)
@@ -1217,7 +1244,7 @@ def step_run_mode(s):
         s.outdir = out
         break
 
-    needed = estimate_disk_mb(s.remaining, s.size, s.clean)
+    needed = estimate_disk_mb(s.remaining, s.size, s.clean, anchors_in_use(s))
     free = shutil.disk_usage(nearest_existing_parent(s.outdir)).free / 1e6
     if needed > free:
         warn(f"This run may need about {needed / 1000:.1f} GB but only {free / 1000:.1f} GB is free where the "
@@ -1252,6 +1279,12 @@ def output_note(s):
     return ""
 
 
+def anchors_text(s):
+    if s.anchor_mode == "spread":
+        return f"up to {s.anchor_num} per ligand, spread across the shared core"
+    return f"{s.anchor_num} ({s.anchor_mode})"
+
+
 def step_review(s):
     heading(6, "Review")
     names = ", ".join(r.name for r in s.kept[:3]) + (" ..." if len(s.kept) > 3 else "")
@@ -1266,7 +1299,7 @@ def step_review(s):
     else:
         rows = [("Receptor", s.receptor), ("Template", s.template)]
     rows += [("Ligands", f"{len(s.kept)} of {s.all_count} in {s.ligands} ({names})"),
-            ("Anchors", f"{s.anchor_num} ({s.anchor_mode})"), ("Search box", f"{s.size} A"),
+            ("Anchors", anchors_text(s)), ("Search box", f"{s.size} A"),
             ("Output folder", s.outdir + output_note(s))]
     if s.seed is not None:
         rows.append(("Random seed", s.seed))

@@ -331,15 +331,18 @@ If some ligands are flagged, the assistant offers to **leave them out and dock t
 
 ### Step 4: docking settings
 
-You are first offered the recommended settings: 3 anchors (or fewer if the weakest ligand has fewer usable ones), random anchor choice, and a 20 Å search box. Press Enter to accept them. If you answer `no`, you are asked for:
+**What an anchor is.** For each ligand the assistant finds the atoms it shares with the template (the maximum common substructure) and uses some of them as *anchors*. Each anchor atom is gently pulled towards the position of its matching atom in the template. The parts of the ligand that differ from the template are free.
+
+You are first offered the recommended settings: **as many anchors as the shared core allows, at most 17, chosen to be as far apart from each other as possible** (so the whole core is held in place), and a 20 Å search box. Press Enter to accept them. Two limits apply: the AutoDock-GPU build here supports at most 17 anchors, and an atom with a symmetric twin in the core is never used as an anchor. A core bigger than 17 usable atoms is therefore held by 17 well-spread atoms rather than by every atom. If you answer `no`, you are asked for:
 
 | Question | What it means | Advice |
 |---|---|---|
-| Anchor selection | `random` picks anchors at random from the shared core; `area` tries many random sets and keeps the three that span the largest triangle | Keep `random` to start. Try `area` if poses are rotated about the core. `area` always uses exactly 3 anchors. |
-| Number of anchor atoms (`random` only) | How many shared-core atoms are pulled towards the template | Keep `3`. More anchors hold the ligand more rigidly. The most the software supports is 17, and the assistant refuses larger numbers. |
+| Anchor selection | `spread` takes up to a maximum number of shared-core atoms that are furthest apart from each other (no randomness); `random` picks a number of anchors at random; `area` tries many random sets and keeps the three that span the largest triangle | Keep `spread`. Use `random` or `area` only to compare with earlier runs. `area` always uses exactly 3 anchors. |
+| Maximum number of anchor atoms (`spread` only) | The most anchors any ligand gets; a ligand with a smaller usable core uses all it has | Keep the maximum (17). Fewer anchors let the core move more. |
+| Number of anchor atoms (`random` only) | How many shared-core atoms are pulled towards the template | Try `3` to start. More anchors hold the ligand more rigidly. The most the software supports is 17, and the assistant refuses larger numbers. |
 | Number of random attempts (`area` only) | How many anchor sets to try | Keep `100`. |
 | Search box size | Size (Å) of the cube around the template in which docking happens | Keep `20`. The assistant warns if the box is not larger than the template, and refuses more than 95 Å. Run time and disk use grow with the cube of the size, so a 40 Å box needs about 8 times the disk space of a 20 Å box. |
-| Random seed | A number that makes the anchor choice repeatable | Enter a whole number of 0 or higher, e.g. `1`, to be able to rerun and get the same anchors. Leave blank otherwise. |
+| Random seed (not asked in `spread` mode, which has no random element) | A number that makes the anchor choice repeatable | Enter a whole number of 0 or higher, e.g. `1`, to be able to rerun and get the same anchors. Leave blank otherwise. |
 | Expert options | A manual core pattern (SMARTS) and debug output | Say `no` unless you know what a SMARTS pattern is. |
 
 Finally you are asked whether to **delete intermediate files** after each ligand. They take about 30 MB per ligand. The suggestion is `yes` for 10 or more ligands and `no` for fewer. Deleting them is safe for scores: they are kept in `results.csv` and in the SDF files.

@@ -108,6 +108,27 @@ def find_anchors(smart_pattern):
             anchors.append((smart_pattern, idx))
     return anchors
 
+def spread_selection(positions, count):
+    """Indices of up to `count` positions that are as far apart from each other as possible.
+
+    Farthest-point sampling: start with the position farthest from the centre of all of them, then keep
+    adding the position whose nearest already-chosen neighbour is farthest away. The result does not
+    depend on a random seed. If there are fewer positions than `count`, all of them are returned.
+    """
+    points = np.asarray(positions, dtype=float)
+    count = min(count, len(points))
+    if count <= 0:
+        return []
+    chosen = [int(np.argmax(np.linalg.norm(points - points.mean(axis=0), axis=1)))]
+    nearest = np.linalg.norm(points - points[chosen[0]], axis=1)
+    while len(chosen) < count:
+        nearest[chosen] = -1.0  # never pick the same position twice, even if some coincide
+        following = int(np.argmax(nearest))
+        chosen.append(following)
+        nearest = np.minimum(nearest, np.linalg.norm(points - points[following], axis=1))
+    return sorted(chosen)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--template_file", help="Input SDF file", required=True)
@@ -116,8 +137,8 @@ def parse_arguments():
     parser.add_argument("--docking_dir", help="Directory for docking", required=True)
     parser.add_argument("--query_smarts", help="Manual SMARTS query for anchor points", default=None)
     parser.add_argument("--anchor_indices", nargs="+", type=int, help="Specify anchor points by atom indices. Query SMILES must be provided. Indices is 0-based.", default=None)
-    parser.add_argument("--anchor_num", type=int, default=3, help="Number of anchor points")
-    parser.add_argument("--anchor_mode", choices=["random", "area"], default="random", help="Anchor point selection mode. the number of anchor of area mode is always 3.")
+    parser.add_argument("--anchor_num", type=int, default=3, help="Number of anchor points (a maximum in spread mode; 0 means every usable atom)")
+    parser.add_argument("--anchor_mode", choices=["random", "area", "spread"], default="random", help="Anchor point selection mode. The number of anchors of area mode is always 3. Spread mode takes up to --anchor_num atoms of the shared core that are as far apart as possible (fewer if the core has fewer usable atoms).")
     parser.add_argument("--size", type=float, help="Size of docking box", default=20.0)
     parser.add_argument("--force", action="store_true", help="Force to overwrite the directory")
     parser.add_argument("--adg_path", default=None,
@@ -147,7 +168,7 @@ def parse_arguments():
         raise ValueError("Query SMILES must be provided when anchor indices are specified.")
     if args.anchor_indices is not None and args.anchor_num > 0:
         print("Anchor indices are specified. Anchor number will be ignored.")
-    if args.anchor_indices is not None and args.anchor_mode == "area":
+    if args.anchor_indices is not None and args.anchor_mode in ("area", "spread"):
         print("Anchor indices are specified. Anchor mode will be ignored.")
     return args
 
@@ -339,6 +360,10 @@ def find_anchor_points(template_mol, input_mol, anchor_num, samples, random_seed
                 sample_idx = rng.choice(len(anchor_patterns_all), size=min(anchor_num, len(anchor_patterns_all)), replace=False)
                 anchor_patterns = [anchor_patterns_all[idx] for idx in sample_idx]
                 anchor_positions = [anchor_positions_all[idx] for idx in sample_idx]
+            elif anchor_mode == "spread":
+                chosen = spread_selection(anchor_positions_all, anchor_num)
+                anchor_patterns = [anchor_patterns_all[idx] for idx in chosen]
+                anchor_positions = [anchor_positions_all[idx] for idx in chosen]
             elif anchor_mode == "area":
                 anchor_num = 3
                 area_max = -1

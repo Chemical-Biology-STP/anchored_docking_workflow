@@ -307,3 +307,101 @@ def test_all_good_batch_exits_cleanly(tmp_path, monkeypatch, capsys):
     ad.main()  # must not raise SystemExit
     assert "1 of 1 ligand(s) docked, 0 failed" in capsys.readouterr().out
     assert summary_by_index(out)[0]["status"] == "docked"
+
+
+# --------------------------------------------------------------------------
+# Spread anchor selection
+# --------------------------------------------------------------------------
+
+
+def test_spread_selection_picks_the_corners_of_a_square():
+    square = [[0, 0, 0], [10, 0, 0], [0, 10, 0], [10, 10, 0], [5, 5, 0]]
+    assert ad.spread_selection(square, 4) == [0, 1, 2, 3]
+    assert ad.spread_selection(square, 2) in ([0, 3], [1, 2])      # opposite corners
+
+
+def test_spread_selection_takes_the_ends_of_a_line():
+    line = [[x, 0, 0] for x in range(10)]
+    assert ad.spread_selection(line, 2) == [0, 9]
+    assert ad.spread_selection(line, 3) == [0, 4, 9] or ad.spread_selection(line, 3) == [0, 5, 9]
+
+
+def test_spread_selection_returns_everything_when_asked_for_more():
+    points = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+    assert ad.spread_selection(points, 17) == [0, 1, 2]
+    assert ad.spread_selection(points, 0) == [] and ad.spread_selection([], 3) == []
+
+
+def test_spread_selection_never_repeats_a_position():
+    same = [[1.0, 1.0, 1.0]] * 4 + [[5.0, 0.0, 0.0]]
+    chosen = ad.spread_selection(same, 4)
+    assert len(chosen) == len(set(chosen)) == 4
+
+
+def test_spread_selection_is_deterministic_and_spreads_wider_than_random_picks():
+    import numpy as np
+
+    template = Chem.SDMolSupplier(TEMPLATE)[0]
+    points = template.GetConformer().GetPositions()
+
+    def min_gap(indices):
+        chosen = points[list(indices)]
+        return min(np.linalg.norm(a - b) for i, a in enumerate(chosen) for b in chosen[i + 1:])
+
+    spread = ad.spread_selection(points, 6)
+    assert spread == ad.spread_selection(points, 6)
+    rng = np.random.default_rng(0)
+    random_gaps = [min_gap(rng.choice(len(points), 6, replace=False)) for _ in range(200)]
+    assert min_gap(spread) > np.percentile(random_gaps, 95)
+
+
+def anchor_search(mode, number, seed=None):
+    template = Chem.SDMolSupplier(TEMPLATE)[0]
+    ligand = Chem.SDMolSupplier(LIGAND)[0]
+    return template, ad.find_anchor_points(template, ligand, number, 100, seed, anchor_mode=mode)
+
+
+def test_spread_mode_anchors_are_core_atoms_at_their_template_positions():
+    import numpy as np
+
+    template, search = anchor_search("spread", 8)
+    assert len(search.anchor_patterns) == len(search.anchor_positions) == 8
+    assert len({idx for _, idx in search.anchor_patterns}) == 8
+    template_positions = template.GetConformer().GetPositions()
+    for _, idx in search.anchor_patterns:
+        target = template_positions[search.ptn2template[idx]]
+        assert any(np.allclose(target, p) for p in search.anchor_positions)
+
+
+def test_spread_selection_starts_from_the_position_farthest_from_the_centre():
+    # The middle point comes first in the list but must not be used when two points are asked for.
+    assert ad.spread_selection([[5, 0, 0], [0, 0, 0], [10, 0, 0]], 2) == [1, 2]
+
+
+def test_spread_mode_applies_the_selection_to_the_shared_core():
+    import numpy as np
+
+    _, everything = anchor_search("random", 0)
+    wanted = ad.spread_selection(everything.anchor_positions, 8)
+    _, search = anchor_search("spread", 8)
+    assert search.anchor_patterns == [everything.anchor_patterns[i] for i in wanted]
+    assert np.allclose(search.anchor_positions, [everything.anchor_positions[i] for i in wanted])
+
+
+def test_spread_mode_does_not_depend_on_the_seed():
+    _, first = anchor_search("spread", 8, seed=1)
+    _, second = anchor_search("spread", 8, seed=2)
+    assert first.anchor_patterns == second.anchor_patterns
+
+
+def test_spread_mode_uses_every_usable_atom_when_the_core_is_smaller_than_the_request():
+    _, everything = anchor_search("random", 0)
+    available = len(everything.anchor_patterns)
+    _, search = anchor_search("spread", available + 10)          # random mode would raise here
+    assert len(search.anchor_patterns) == available
+    with pytest.raises(ValueError, match="Not enough anchor points"):
+        anchor_search("random", available + 10)
+
+
+def test_spread_is_a_valid_mode_and_part_of_the_resume_signature():
+    assert ad.signature_differences(signature(), signature(anchor_mode="spread")) == ["anchor_mode"]
