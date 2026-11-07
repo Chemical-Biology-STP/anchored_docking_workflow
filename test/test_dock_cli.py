@@ -808,20 +808,57 @@ def test_wizard_can_drop_the_reservation(monkeypatch, tmp_path):
     assert "--reservation" not in (tmp_path / "submit_dock_CAT-13f.sh").read_text()
 
 
-def wizard_with_custom_build(monkeypatch, tmp_path, targets, partition):
+def wizard_with_custom_build(monkeypatch, tmp_path, targets, partition, needed=40, override="", mismatch=False):
+    """Run the wizard where the ligand is measured to need `needed` atom types and a custom build exists."""
     folder = custom_build(tmp_path, targets)
     monkeypatch.setattr(d, "find_custom_build", lambda: (str(folder), 64))
-    monkeypatch.setattr(d, "CUSTOM_BUILD_FROM_ANCHORS", 5)         # the example has 17 usable anchors
-    answers = [RECEPTOR, TEMPLATE, LIGAND, "", "", "",              # custom build offer, recommended settings, clean
-               save_choice(), str(tmp_path / "o"), "", ""]
-    answers += ["yes", partition, "", "", "", ""] if partition != d.DEFAULT_PARTITION else ["no"]
-    answers += ["", ""]                                             # fall back to the module (if asked), confirm
+    monkeypatch.setattr(d, "atom_types_needed", lambda template, mol: needed)
+    monkeypatch.setattr(d, "standard_ligand_types", lambda: 30)       # so the example (17 anchors) is measured at all
+    answers = [RECEPTOR, TEMPLATE, LIGAND, "", "",                  # recommended settings, clean intermediates
+               save_choice(), str(tmp_path / "o"), "", ""]          # how to run, output folder, job name, time limit
+    if partition != d.DEFAULT_PARTITION:
+        answers += ["yes", partition, "", "", "", ""]               # change settings: partition, reservation, GPUs, modules, pixi
+        if needed > d.MAX_ATOM_TYPES:
+            answers += [override]                                   # use the higher-limit build? (only asked when it is in use)
+        if mismatch:
+            answers += [""]                                         # fall back to the cluster module
+    else:
+        answers += ["no"]
+    answers += [""]                                                 # confirm
     run_wizard(monkeypatch, answers)
     return folder, (tmp_path / "submit_dock_CAT-13f.sh").read_text()
 
 
+def test_the_higher_limit_build_is_used_without_asking_when_a_ligand_needs_it(monkeypatch, tmp_path, capsys):
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80 90", d.DEFAULT_PARTITION)
+    text = capsys.readouterr().out
+    assert f"--adg_path {folder}" in script
+    assert "need more AutoDock atom types" in text and "(40 against 32)" in text
+    assert "Use the custom" not in text                              # no question about it any more
+
+
+def test_the_default_autodock_gpu_is_kept_when_no_ligand_needs_more_atom_types(monkeypatch, tmp_path, capsys):
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80 90", d.DEFAULT_PARTITION, needed=30)
+    assert "--adg_path" not in script and "need more AutoDock atom types" not in capsys.readouterr().out
+
+
+def test_a_missing_build_is_reported_instead_of_silently_reducing_anchors(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "find_custom_build", lambda: None)
+    monkeypatch.setattr(d, "atom_types_needed", lambda template, mol: 40)
+    monkeypatch.setattr(d, "standard_ligand_types", lambda: 30)
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "", "no", ""])
+    text = capsys.readouterr().out
+    assert "They will get fewer anchors" in text and "build_autodock_gpu.sh" in text
+    assert "--adg_path" not in (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+
+
+def test_the_user_can_still_choose_the_default_autodock_gpu(monkeypatch, tmp_path):
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80 90", "gh100", override="no")
+    assert "--adg_path" not in script
+
+
 def test_a_custom_build_for_the_wrong_gpu_is_replaced_by_the_cluster_module(monkeypatch, tmp_path, capsys):
-    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80", "gh100")
+    folder, script = wizard_with_custom_build(monkeypatch, tmp_path, "80", "gh100", mismatch=True)
     assert "--adg_path" not in script
     assert "would fail" in capsys.readouterr().out
 
@@ -831,10 +868,93 @@ def test_a_custom_build_for_both_gpus_is_kept_on_either_partition(monkeypatch, t
     assert f"--adg_path {folder}" in script and "would fail" not in capsys.readouterr().out
 
 
-def test_the_offer_names_the_gpus_the_custom_build_was_made_for(monkeypatch, tmp_path, capsys):
+def test_the_message_names_the_gpus_the_custom_build_was_made_for(monkeypatch, tmp_path, capsys):
     wizard_with_custom_build(monkeypatch, tmp_path, "80 90", d.DEFAULT_PARTITION)
     text = capsys.readouterr().out
     assert "A100 (ga100)" in text and "H100 (gh100)" in text
+
+
+class Ligand:
+    def __init__(self, anchors, mol="mol"):
+        self.anchors, self.mol, self.atom_types = anchors, mol, 0
+
+
+def test_only_ligands_that_could_exceed_the_limit_are_measured(monkeypatch):
+    seen = []
+    monkeypatch.setattr(d, "atom_types_needed", lambda template, mol: (seen.append(mol), 40)[1])
+    fits = d.MAX_ATOM_TYPES - d.standard_ligand_types()              # 17: even 15 other types cannot exceed 32
+    ligands = [Ligand(fits, "small"), Ligand(fits + 1, "borderline"), Ligand(30, "large"), Ligand(10, "tiny")]
+    d.measure_atom_types(d.Settings(kept=ligands, template_mol="template"))
+    assert sorted(seen) == ["borderline", "large"]
+    assert [l.atom_types for l in ligands] == [0, 40, 40, 0]
+
+
+def test_a_ligand_that_cannot_be_measured_is_left_at_zero(monkeypatch):
+    monkeypatch.setattr(d, "atom_types_needed", lambda template, mol: None)
+    ligand = Ligand(30)
+    d.WARNINGS.clear()
+    d.measure_atom_types(d.Settings(kept=[ligand], template_mol="template"))
+    assert ligand.atom_types == 0
+    assert any("could not be measured" in w for w in d.WARNINGS)       # and the user is told
+    d.choose_autodock_gpu(d.Settings(kept=[ligand]))                 # and does not trigger the higher-limit build
+
+
+@pytest.mark.parametrize("needed, uses_build", [(31, False), (32, False), (33, True)])
+def test_a_ligand_that_needs_exactly_the_limit_still_fits_the_default(monkeypatch, tmp_path, needed, uses_build):
+    monkeypatch.setattr(d, "find_custom_build", lambda: (str(custom_build(tmp_path, "80 90")), 64))
+    ligand = Ligand(30)
+    ligand.atom_types = needed
+    s = d.Settings(kept=[ligand])
+    d.choose_autodock_gpu(s)
+    assert bool(s.adg_path) is uses_build
+
+
+def test_the_missing_build_warning_is_repeated_in_the_final_review(monkeypatch):
+    monkeypatch.setattr(d, "find_custom_build", lambda: None)
+    d.WARNINGS.clear()
+    ligand = Ligand(30)
+    ligand.atom_types = 40
+    d.choose_autodock_gpu(d.Settings(kept=[ligand]))
+    assert any("fewer anchors" in w for w in d.WARNINGS)
+
+
+def test_a_build_with_too_low_a_limit_is_used_but_flagged(monkeypatch, tmp_path):
+    monkeypatch.setattr(d, "find_custom_build", lambda: (str(custom_build(tmp_path, "80 90")), 40))
+    s = d.Settings(kept=[Ligand(30)])
+    s.kept[0].atom_types = 50
+    d.choose_autodock_gpu(s)
+    assert s.adg_path and any("only 40 atom types" in w for w in d.WARNINGS)
+
+
+def test_the_exact_atom_type_count_matches_what_the_job_will_need():
+    import anchored_docking as ad
+    if shutil.which("mk_prepare_ligand.py") is None:
+        pytest.skip("Meeko is not on PATH (run the tests through pixi)")
+    template = Chem.SDMolSupplier(TEMPLATE)[0]
+    needed = d.atom_types_needed(template, template)                  # the crystal ligand onto itself: 22 usable anchors
+    import argparse
+    import tempfile
+    args = argparse.Namespace(anchor_num=100, samples=100, random_seed=None, query_smarts=None,
+                              anchor_indices=None, anchor_mode="spread", verbose=False)
+    with tempfile.TemporaryDirectory() as folder:
+        search, _, _, note = ad.prepare_anchored_ligand(
+            args, {"scripts_path": os.path.join(REPO, "scripts"), "atom_type_limit": needed}, template, template, folder)
+    assert len(search.anchor_patterns) == 22 and note == ""          # a limit of exactly `needed` keeps every anchor
+    with tempfile.TemporaryDirectory() as folder:
+        _, _, _, note = ad.prepare_anchored_ligand(
+            args, {"scripts_path": os.path.join(REPO, "scripts"), "atom_type_limit": needed - 1}, template, template, folder)
+    assert note                                                        # one fewer and anchors are dropped
+
+
+def test_a_ligand_that_cannot_be_prepared_is_unmeasurable_not_an_error(monkeypatch):
+    import anchored_docking as ad
+
+    def refuse(*args, **kwargs):
+        raise ad.LigandError("RDKit could not generate 3D coordinates")
+
+    monkeypatch.setattr(ad, "prepare_anchored_ligand", refuse)
+    template = Chem.SDMolSupplier(TEMPLATE)[0]
+    assert d.atom_types_needed(template, template) is None
 
 
 def test_wizard_asks_for_a_maximum_in_spread_mode_and_no_seed(monkeypatch, tmp_path, capsys):

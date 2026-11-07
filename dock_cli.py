@@ -53,8 +53,6 @@ LARGE_BOX_SIZE = 40.0
 # Grid maps and other files for one ligand with the default 20 A box (measured on the example).
 MB_PER_LIGAND_20A = 30.0
 MB_PER_ANCHOR_20A = 1.3    # each anchor adds a grid map: 24 MB with 3 anchors, 41 MB with 17 on the example
-# A ligand with more usable anchor atoms than this may need more atom types than the module's AutoDock-GPU has.
-CUSTOM_BUILD_FROM_ANCHORS = MAX_ATOM_TYPES - 8
 MB_KEPT_PER_LIGAND = 1.0   # files kept per ligand when intermediates are deleted
 
 POLL_SECONDS = 10
@@ -534,6 +532,7 @@ class LigandResult:
     anchors: int = 0
     core_atoms: int = 0
     notes: list = field(default_factory=list)  # problems that do not make the ligand impossible, but likely
+    atom_types: int = 0     # AutoDock atom types needed with every usable core atom as an anchor (0 = not measured)
 
 
 def load_atom_types():
@@ -1167,33 +1166,96 @@ def step_files(s):
     s.anchor_limit = min((r.anchors for r in s.kept if r.anchors), default=0)
 
 
-def offer_custom_build(s):
-    """If some ligand has so many usable anchor atoms that the module's AutoDock-GPU may not fit them all,
-    offer a build with a higher atom-type limit (made by scripts/build_autodock_gpu.sh) when one exists."""
-    biggest = max((r.anchors for r in s.kept if r.anchors), default=0)
-    build = find_custom_build()
-    if biggest <= CUSTOM_BUILD_FROM_ANCHORS:
+def standard_ligand_types():
+    """Number of ligand atom types AutoGrid makes maps for (read from scripts/write-gpf.py)."""
+    try:
+        with open(os.path.join(REPO_DIR, "scripts", "write-gpf.py"), errors="replace") as fh:
+            match = re.search(r"^ligand_types (.+)$", fh.read(), re.M)
+        return len(match.group(1).split())
+    except (OSError, AttributeError):
+        return 15
+
+
+def atom_types_needed(template_mol, mol):
+    """Exactly how many AutoDock atom types the ligand needs with every usable core atom as an anchor.
+
+    This runs the same anchor choice and Meeko preparation as the job, in a temporary folder, and counts the
+    types in the PDBQT. Returns None if the ligand cannot be prepared (it is reported elsewhere).
+    """
+    import argparse
+    import tempfile
+
+    import anchored_docking as ad
+
+    args = argparse.Namespace(anchor_num=0, samples=100, random_seed=None, query_smarts=None,
+                              anchor_indices=None, anchor_mode="spread", verbose=False)
+    tools = {"scripts_path": os.path.join(REPO_DIR, "scripts"), "atom_type_limit": 10 ** 9}
+    try:
+        with tempfile.TemporaryDirectory(prefix="atom_types_") as folder:
+            ad.prepare_anchored_ligand(args, tools, template_mol, mol, folder)
+            return len(ad.ligand_atom_types(os.path.join(folder, "ligand.pdbqt")))
+    except Exception:  # noqa: BLE001 - a ligand that cannot be prepared fails later with its own message
+        return None
+
+
+def measure_atom_types(s):
+    """Fill in LigandResult.atom_types for the ligands that could need more atom types than the default AutoDock-GPU has.
+
+    Other atoms of a ligand have at most standard_ligand_types() different types, so a ligand whose usable core
+    atoms number MAX_ATOM_TYPES minus that always fits and is not measured.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    always_fits = MAX_ATOM_TYPES - standard_ligand_types()
+    todo = [r for r in s.kept if r.mol is not None and r.anchors > always_fits]
+    if not todo:
         return
+    say(f"\n  Checking how many AutoDock atom types {len(todo)} ligand(s) with large cores need...")
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+        for ligand, needed in zip(todo, pool.map(lambda r: atom_types_needed(s.template_mol, r.mol), todo)):
+            ligand.atom_types = needed or 0
+    unmeasured = [r for r in todo if not r.atom_types]
+    if unmeasured:
+        warn(f"The atom types of {len(unmeasured)} of {len(todo)} ligand(s) with large cores could not be measured, so "
+             "the AutoDock-GPU with a higher atom-type limit was not considered for them. A ligand that needs "
+             "more atom types than the cluster's AutoDock-GPU supports then gets fewer anchors, and the results "
+             "table says so.")
+
+
+def choose_autodock_gpu(s):
+    """Use the AutoDock-GPU with a higher atom-type limit when some ligand needs it, without asking.
+
+    The default AutoDock-GPU supports MAX_ATOM_TYPES atom types per ligand; the anchors count towards that
+    limit. Ligands over it would get fewer anchors, so a build with a higher limit is used if one exists.
+    """
+    over = [r for r in s.kept if r.atom_types > MAX_ATOM_TYPES]
+    if not over:
+        return
+    most = max(r.atom_types for r in over)
+    build = find_custom_build()
     if build is None:
-        note(f"A ligand has {biggest} usable anchor atoms. The cluster's AutoDock-GPU supports {MAX_ATOM_TYPES} atom types, "
-             "so it may have to use fewer anchors for that ligand (the results table says when). "
+        warn(f"{len(over)} ligand(s) need more AutoDock atom types than the cluster's AutoDock-GPU supports "
+             f"({most} against {MAX_ATOM_TYPES}). They will get fewer anchors; the results table says how many. "
              "scripts/build_autodock_gpu.sh builds a version with a higher limit.")
         return
     folder, limit = build
-    say(f"\n  A ligand has {biggest} usable anchor atoms, and a custom AutoDock-GPU with a limit of {limit} atom types")
-    say(f"  (instead of {MAX_ATOM_TYPES}) is available in {folder}.")
+    s.adg_path = folder
+    say(f"\n  {len(over)} ligand(s) need more AutoDock atom types than the cluster's AutoDock-GPU supports "
+        f"({most} against {MAX_ATOM_TYPES}),")
+    say(f"  so the build with a limit of {limit} atom types is used: {folder}")
     have = build_targets(folder)
     if have:
         names = {"80": "A100 (ga100)", "90": "H100 (gh100)"}
         note("It was built for: " + ", ".join(names.get(t, f"compute capability {t}") for t in have) + ".")
-    if ask_yes_no("Use the custom AutoDock-GPU?", True):
-        s.adg_path = folder
+    if limit < most:
+        warn(f"Even that build supports only {limit} atom types, fewer than the {most} the largest ligand needs.")
 
 
 def step_settings(s):
     heading(4, "Docking settings")
     usable = s.anchor_limit
-    offer_custom_build(s)
+    measure_atom_types(s)
+    choose_autodock_gpu(s)
     limit = atom_type_limit(s)
     default_anchors = min(3, usable, limit - 1) if usable else 3   # for the random mode
     say("  Anchors are atoms of the shared core (the maximum common substructure of each ligand and the")
@@ -1352,6 +1414,8 @@ def step_run_mode(s):
         s.gpus = ask_number("Number of GPUs", s.gpus, int, 1)
         s.modules = ask("Modules to load (comma-separated; GCC must come first)", s.modules)
         s.pixi_dir = ask("Folder containing the pixi program", s.pixi_dir or os.path.expanduser("~/.local/bin"))
+        if s.adg_path and not ask_yes_no("Use the AutoDock-GPU with the higher atom-type limit that some ligands need?", True):
+            s.adg_path = ""
     elif not s.pixi_dir:
         s.pixi_dir = ask("Folder containing the pixi program", os.path.expanduser("~/.local/bin"))
     problem = build_problem(s)
