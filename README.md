@@ -126,6 +126,12 @@ A problem with one ligand (it cannot be read, has no shared core, fails 3D embed
 
 A ligand whose 3D coordinates cannot be generated is reported as failed. Earlier versions carried on with a flat 2D geometry, which Meeko accepted without complaint. Each embedding attempt is limited to 30 seconds.
 
+## Choosing the template from a structure file
+
+When the wizard starts from a PDB or mmCIF file it lists the molecules that could be the template. Residue codes such as `AQ4` mean nothing to most people, so each molecule is shown as a chemist would name it: a name (a common name when the dictionary has one, such as Erlotinib or Heme, otherwise a shortened systematic name; the full name is printed below the table), its complete formula, and the residue code, chain and residue number in three columns for telling copies apart. The SMILES of ligand-like molecules (kinds `ligand` and `cofactor`) are printed under the table, once per distinct molecule with all the row numbers it covers.
+
+The information comes from the PDB's chemical component dictionary (`files.rcsb.org/ligands`), looked up once per distinct residue name, in parallel and with a 6-second limit each, and reused for the template's hydrogens afterwards. Without a connection the wizard says so and falls back to the formula of the heavy atoms in the file, marked `(no H)`; nothing else changes.
+
 ## Protein preparation
 
 `pixi run dock` prepares the protein before docking (`protein_prep.py`); `anchored_docking.py` itself only uses the receptor it is given.

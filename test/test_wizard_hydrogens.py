@@ -37,7 +37,7 @@ def test_template_hydrogens_come_from_the_dictionary_when_it_can_be_reached(monk
 
     work = run(monkeypatch, tmp_path, fetch)
     text = capsys.readouterr().out
-    assert asked == ["LIG"]
+    assert asked.count("LIG") == 1                       # the template's entry is reused, not downloaded a second time
     assert "Template hydrogens for display: added from the component dictionary" in text
     view = work / "dock_CAT-13f_template_with_hydrogens.sdf"
     mol = Chem.SDMolSupplier(str(view), removeHs=False)[0]
@@ -64,7 +64,9 @@ def test_a_mismatched_dictionary_entry_is_explained(monkeypatch, tmp_path, capsy
     assert "Template hydrogens for display: not added" in text and "does not match the component dictionary" in text
 
 
-def test_the_dictionary_is_only_asked_about_the_chosen_template(monkeypatch, tmp_path):
+def test_the_dictionary_is_asked_once_for_each_molecule_listed_and_for_nothing_else(monkeypatch, tmp_path):
     asked = []
     run(monkeypatch, tmp_path, lambda name, timeout=15: asked.append(name))
-    assert asked == ["LIG"]  # not the sulfate, glycerol or zinc
+    # the molecules in the template table (so the user can tell the drug from glycerol and sulfate), each once;
+    # the zinc ion is too small to be a candidate and is never looked up
+    assert sorted(asked) == ["GOL", "LIG", "SO4"]

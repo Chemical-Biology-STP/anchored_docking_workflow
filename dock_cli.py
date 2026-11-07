@@ -1055,9 +1055,40 @@ def show_inventory(inv):
          + ".")
 
 
-def choose_template(inv):
+def molecule_rows(shown, components):
+    """Table rows for the molecules offered as template: what each one is, in terms a chemist recognises.
+
+    The name and complete formula come from the PDB's chemical component dictionary. Without them (offline, or an
+    unregistered molecule) the formula of the heavy atoms in the file is shown instead, marked as having no hydrogens.
+    """
+    rows = []
+    for n, het in enumerate(shown, 1):
+        info = components.describe(het.name)
+        formula = info.formula or (f"{het.heavy_formula} (no H)" if het.heavy_formula else "")
+        rows.append((n, info.name or "(name unavailable)", formula, het.name, het.chain.strip() or "-", het.number,
+                     het.kind, het.heavy, het.contacts))
+    return rows
+
+
+def per_molecule_notes(shown, components, pick):
+    """One line per distinct molecule instead of one per row: copies of a molecule (the same residue code in
+    several chains) share their name and SMILES, so they are listed once under all their row numbers.
+
+    pick(info, het) returns the text for a molecule, or "" for none. Returns [("1, 2", text), ...] in table order.
+    """
+    grouped = {}
+    for n, het in enumerate(shown, 1):
+        text = pick(components.describe(het.name), het)
+        if text:
+            grouped.setdefault((het.name, text), []).append(str(n))
+    return [(", ".join(numbers), text) for (_, text), numbers in grouped.items()]
+
+
+def choose_template(inv, components=None):
     """Ask which molecule is the template. Returns a structure_prep.Het, or None to give up on this file."""
     import structure_prep as sp
+
+    components = components or sp.Components()
 
     candidates = sp.template_candidates(inv)
     if not candidates:
@@ -1066,8 +1097,25 @@ def choose_template(inv):
     suggestion = sp.suggested_template(inv)
     say("\n  Which molecule is the template ligand (the one to anchor to)?")
     shown = candidates[:12]
-    table([(n, h.label, h.kind, h.heavy, h.contacts) for n, h in enumerate(shown, 1)],
-          headers=("#", "Molecule", "Kind", "Heavy atoms", "Protein contacts"))
+    found = components.prefetch([h.name for h in shown])
+    table(molecule_rows(shown, components),
+          headers=("#", "Molecule", "Formula", "Code", "Chain", "Residue No.", "Kind", "Heavy atoms",
+                    "Protein contacts"))
+    if shown and not found:
+        note("The names could not be looked up at the PDB (no connection?), so only the formulas of the atoms in the "
+             "file are shown. Hydrogens are not in the file, so the real formulas have more H.")
+    full = per_molecule_notes(shown, components, lambda info, het: info.systematic
+                              if info.systematic and info.systematic.lower() != info.name.lower() else "")
+    if full:
+        say("\n  Full chemical names:")
+        for numbers, text in full:
+            say(f"    {numbers}  {text}")
+    smiles = per_molecule_notes(shown, components,
+                                lambda info, het: info.smiles if het.kind in ("ligand", "cofactor") else "")
+    if smiles:
+        say("\n  SMILES of the ligand-like molecules (paste one into a drawing tool such as PubChem Sketcher to see it):")
+        for numbers, text in smiles:
+            say(f"    {numbers}  {text}")
     if len(candidates) > len(shown):
         note(f"{len(candidates) - len(shown)} smaller or less likely molecules are not shown.")
     default = str(shown.index(suggestion) + 1) if suggestion in shown else None
@@ -1155,6 +1203,7 @@ def prepare_from_complex(s):
 
     say("  A PDB (.pdb) or mmCIF (.cif) file, for example downloaded from rcsb.org. It is only read: your")
     say("  file is not changed. Press Tab to complete file names.\n")
+    components = sp.Components()   # what the molecules are, looked up once and shared by the steps below
     while True:
         s.structure_path = ask("Structure file", validate=file_validator(sp.STRUCTURE_EXTENSIONS),
                                completer=path_completer)
@@ -1166,7 +1215,7 @@ def prepare_from_complex(s):
             continue
         say("")
         show_inventory(inv)
-        template = choose_template(inv)
+        template = choose_template(inv, components)
         if template is None:
             continue
         break
@@ -1176,7 +1225,7 @@ def prepare_from_complex(s):
     keep = ask_molecules(plan)
     say(f"\n  Looking up the chemistry of {template.name} at the PDB to give the template its hydrogens for display...")
     try:
-        prepared = sp.prepare(structure, inv, template, chains, keep, ccd=sp.fetch_ccd)
+        prepared = sp.prepare(structure, inv, template, chains, keep, ccd=components.fetch)
     except sp.PrepError as exc:
         fail(str(exc))
         raise SystemExit(1)

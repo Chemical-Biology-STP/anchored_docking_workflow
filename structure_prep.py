@@ -60,10 +60,16 @@ class Het:
     xyz: object         # heavy-atom coordinates, shape (n, 3)
     contacts: int = 0   # protein atoms within CONTACT_DISTANCE
     distance: float = None  # to the chosen template, once there is one
+    heavy_formula: str = ""  # element counts of the heavy atoms in the file, e.g. C22N3O4 (hydrogens are rarely present)
 
     @property
     def label(self):
         return f"{self.name} {self.chain}{self.num}{self.icode.strip()}"
+
+    @property
+    def number(self):
+        """The residue number as the file writes it, with its insertion code if it has one (e.g. 52A)."""
+        return f"{self.num}{self.icode.strip()}"
 
     @property
     def key(self):
@@ -104,6 +110,16 @@ def _is_polymer(res):
     if res.entity_type == gemmi.EntityType.Polymer:
         return True
     return res.entity_type == gemmi.EntityType.Unknown and res.het_flag == "A"
+
+
+def _heavy_formula(res):
+    """Element counts of the non-hydrogen atoms of a residue in the usual order (C first, then alphabetical)."""
+    counts = {}
+    for atom in res:
+        if not atom.is_hydrogen():
+            counts[atom.element.name] = counts.get(atom.element.name, 0) + 1
+    order = sorted(counts, key=lambda e: (e != "C", e))
+    return "".join(f"{e}{counts[e] if counts[e] > 1 else ''}" for e in order)
 
 
 def _heavy_xyz(res):
@@ -160,7 +176,7 @@ def inventory(st, n_models=1, altloc_atoms=0, path=""):
             else:
                 xyz = _heavy_xyz(res)
                 hets.append(Het(chain.name, res.name, res.seqid.num, (res.seqid.icode or " "), len(xyz),
-                                _kind(res, len(xyz)), xyz))
+                                _kind(res, len(xyz)), xyz, heavy_formula=_heavy_formula(res)))
         if amino and amino >= nuc:
             protein[chain.name] = amino
             by_chain[chain.name] = np.vstack(chain_xyz)
@@ -268,6 +284,100 @@ def fetch_ccd(name, timeout=15):
         return gemmi.cif.read_string(text)[0]
     except Exception:  # offline, unknown component, malformed reply: all mean "not available"
         return None
+
+
+@dataclass
+class Component:
+    """What the PDB's chemical component dictionary says about a residue name, in terms a chemist uses."""
+    code: str
+    name: str = ""        # a recognisable name (Erlotinib, Heme, Glycerol); empty if unknown
+    systematic: str = ""  # the dictionary's full chemical name, as written there
+    formula: str = ""     # complete formula including hydrogens (C22H23N3O4); empty if unknown
+    smiles: str = ""
+
+
+NAME_MAX = 30   # longer systematic names are replaced by a common synonym when there is one
+
+
+def _cif_text(block, tag):
+    value = block.find_value(tag)
+    if value is None:
+        return ""
+    text = gemmi.cif.as_string(value).strip()
+    return "" if text in ("?", ".") else text
+
+
+def friendly_name(code, systematic, synonyms):
+    """A name a chemist recognises. Systematic names of drugs are very long ('[6,7-BIS(2-METHOXY-ETHOXY)QUINAZOLINE-4-YL]
+    -(3-ETHYNYLPHENYL)AMINE'), so a short one is kept and a long one is replaced by the first common synonym
+    (preferring one without digits, which skips lab codes such as STI-571 in favour of IMATINIB)."""
+    names = [n.strip() for n in re.split(r"[;\n]", synonyms or "") if n.strip()]
+    if systematic and len(systematic) <= NAME_MAX:
+        chosen = systematic
+    elif names:
+        chosen = next((n for n in names if not re.search(r"\d", n)), names[0])
+    else:
+        chosen = systematic
+    if not chosen:
+        return ""
+    chosen = re.sub(r"^\[\d+[RSrs]-\([^)]*\)\]-", "", chosen)   # a leading stereo-descriptor, e.g. [4R-(4ALPHA,5ALPHA)]-
+    if chosen.isupper():                       # the dictionary writes many names in capitals
+        chosen = chosen[0] + chosen[1:].lower()
+    return chosen if len(chosen) <= NAME_MAX + 4 else chosen[:NAME_MAX + 1].rstrip() + "..."
+
+
+def component_from_block(code, block):
+    """A Component from a dictionary entry (a gemmi cif block), or an empty one if there is none."""
+    if block is None:
+        return Component(code)
+    smiles = ""
+    try:
+        descriptors = {}
+        for kind, text in block.find("_pdbx_chem_comp_descriptor.", ["type", "descriptor"]):
+            descriptors.setdefault(gemmi.cif.as_string(kind), gemmi.cif.as_string(text))
+        smiles = descriptors.get("SMILES_CANONICAL") or descriptors.get("SMILES") or ""
+    except Exception:  # noqa: BLE001 - a missing or odd table only means no SMILES
+        pass
+    systematic = _cif_text(block, "_chem_comp.name")
+    return Component(code,
+                     name=friendly_name(code, systematic, _cif_text(block, "_chem_comp.pdbx_synonyms")),
+                     systematic=systematic, formula=_cif_text(block, "_chem_comp.formula").replace(" ", ""), smiles=smiles)
+
+
+LOOKUP_SECONDS = 6      # per molecule; offline, the answer should come quickly rather than stall the wizard
+
+
+class Components:
+    """Dictionary entries for the molecules of one structure, fetched once per residue name.
+
+    fetch(name) has the signature of fetch_ccd, so it can also be handed to prepare() and the template's
+    entry is not downloaded a second time. The download function is looked up when it is needed.
+    """
+
+    def __init__(self, fetch=None):
+        self._fetch = fetch
+        self.blocks = {}
+
+    def fetch(self, name, timeout=15):
+        key = (name or "").upper()
+        if key not in self.blocks:
+            self.blocks[key] = (self._fetch or fetch_ccd)(name)
+        return self.blocks[key]
+
+    def prefetch(self, names):
+        """Fetch several entries at once. Returns how many were found."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        todo = sorted({(n or "").upper() for n in names} - set(self.blocks))
+        if todo:
+            fetch = self._fetch or fetch_ccd
+            with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+                for name, block in zip(todo, pool.map(lambda n: fetch(n, LOOKUP_SECONDS), todo)):
+                    self.blocks[name] = block
+        return sum(1 for n in names if self.blocks.get((n or "").upper()) is not None)
+
+    def describe(self, name):
+        return component_from_block(name, self.blocks.get((name or "").upper()))
 
 
 def template_mol_from_residue(st, template):
