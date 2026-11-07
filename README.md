@@ -136,6 +136,19 @@ A ligand whose 3D coordinates cannot be generated is reported as failed. Earlier
 - The result is saved as `<job>_receptor.pdb` with `<job>_protonation_report.txt` (states, pKa values near the template, flips, rebuilt atoms, gaps). If PDB2PQR fails, or the user declines, the CLI offers ADFR's rule-based hydrogens (`--add_hydrogens`), which make every histidine cationic.
 - A kept ion or cofactor passes through PDB2PQR unchanged and gets no hydrogens.
 
+## Partitions and access
+
+Not every account may use every GPU partition. Access to `gh100` is controlled by the reservation `h100`, which only listed users can use (the partition itself is open to all accounts). Instead of keeping a list of who may use what, `pixi run dock` asks Slurm itself, with `sbatch --test-only` (it checks the real request, including the number of GPUs and the time limit, and queues nothing):
+
+- It checks the chosen partition and reservation, the default `ga100` included, before the job script is written.
+- If Slurm refuses, the wizard says why in plain words (for example `you are not allowed to use the reservation h100`, or `the partition gh100 can only be used with the reservation h100`), lists the GPU partitions the account can use, and asks again. If the partition works with its usual reservation, it says so. You can still insist, with a warning in the review, but the job will then be refused.
+- If Slurm cannot be reached or does not answer within 30 seconds, the wizard says it could not check and carries on, so a scheduler hiccup is never mistaken for missing access.
+- If a job is refused at submission anyway, the reason is printed.
+- Nothing is checked when you choose to run in the terminal.
+- The AutoDock-GPU build with a higher atom-type limit covers both A100 and H100 GPUs, so an account without `gh100` loses nothing: it uses the same build on `ga100`.
+
+The partition names and reservation the wizard knows about (`ga100`, `gh100`, `h100`) are constants at the top of `dock_cli.py`.
+
 ## AutoDock-GPU with a higher atom-type limit
 
 The AutoDock-GPU module here is compiled for 32 atom types per ligand (`MAX_NUM_OF_ATYPES` in `common/defines.h`). A ligand needs one type per anchor plus the types of its other atoms, so a core of about 30 usable atoms can exceed it. The stock binary then stops with `Too many ligand atom types (more than 32)`. (AutoDock-GPU itself exits with code 0 after that error; the script now catches it.)

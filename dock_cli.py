@@ -32,6 +32,7 @@ DEFAULT_PARTITION = "ga100"
 PARTITION_COMPUTE = {"ga100": "80", "gh100": "90"}
 # Partitions that can only be used together with a reservation.
 PARTITION_RESERVATION = {"gh100": "h100"}
+SUBMIT_CHECK_SECONDS = 30   # how long to wait for Slurm when checking access
 # Deliberately generous: the Bace1 example takes about 2 minutes per ligand.
 MINUTES_PER_LIGAND = 10
 MIN_TIME_MINUTES = 30
@@ -274,6 +275,113 @@ def build_targets(folder):
             return fh.read().split()
     except OSError:
         return None
+
+
+@dataclass
+class SubmitCheck:
+    ok: object          # True, False, or None when it could not be found out
+    reason: str = ""
+
+
+# Replies of the scheduler that mean "try again later" and say nothing about access.
+SCHEDULER_UNAVAILABLE = ("unable to contact", "socket timed out", "connection refused", "slurm controller",
+                         "temporarily")
+
+
+def explain_submit_error(text, partition, reservation=""):
+    """Say in plain words why Slurm refused a job, from its error text."""
+    low = text.lower()
+    if "access denied to requested reservation" in low:
+        return f"you are not allowed to use the reservation {reservation}"
+    if "requested reservation is invalid" in low:
+        return f"the reservation {reservation} does not exist"
+    if "invalid partition" in low:
+        return f"the partition {partition} does not exist"
+    if "invalid account" in low or "account/partition" in low:
+        return f"your account cannot use the partition {partition}"
+    if "invalid qos" in low or "qos" in low and "not permitted" in low:
+        return f"your account has no access to the quality of service that the partition {partition} needs"
+    if "time limit" in low:
+        return f"the time limit is longer than the partition {partition} allows"
+    if "node configuration is not available" in low:
+        needed = PARTITION_RESERVATION.get(partition)
+        if needed and not reservation:
+            return f"the partition {partition} can only be used with the reservation {needed}"
+        return f"no node of the partition {partition} has the requested GPUs"
+    lines = [re.sub(r"^(sbatch: )?(error|allocation failure): ?", "", l.strip(), flags=re.I)
+             for l in text.splitlines() if l.strip()]
+    return lines[0] if lines else "the scheduler refused the job"
+
+
+def check_submission(partition, reservation="", gpus=1, time_limit="0:10:00"):
+    """Ask Slurm whether this account could submit such a job (sbatch --test-only: nothing is queued).
+
+    Access to a partition can depend on the account and on reservations, so Slurm's own rules are used instead of
+    a list kept here.
+    """
+    sbatch = shutil.which("sbatch")  # the real program; the interactive shell wrapper is not visible from here
+    if sbatch is None:
+        return SubmitCheck(None, "sbatch was not found")
+    command = [sbatch, "--test-only", f"--partition={partition}", f"--gres=gpu:{gpus}", f"--time={time_limit}",
+               "--wrap=true"]
+    if reservation:
+        command.insert(2, f"--reservation={reservation}")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=SUBMIT_CHECK_SECONDS,
+                                stdin=subprocess.DEVNULL, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return SubmitCheck(None, "the scheduler did not answer")
+    if result.returncode == 0:
+        return SubmitCheck(True)
+    text = result.stdout + result.stderr
+    if any(word in text.lower() for word in SCHEDULER_UNAVAILABLE):
+        return SubmitCheck(None, "the scheduler could not be reached")
+    return SubmitCheck(False, explain_submit_error(text, partition, reservation))
+
+
+def usable_gpu_partitions(s, exclude=()):
+    """The known GPU partitions this account can submit to, according to Slurm."""
+    found = []
+    for name in PARTITION_COMPUTE:
+        if name in exclude:
+            continue
+        if check_submission(name, PARTITION_RESERVATION.get(name, ""), s.gpus, s.time_limit).ok is True:
+            found.append(name)
+    return found
+
+
+def ask_reservation(s):
+    return ask("Reservation (type none for no reservation)", PARTITION_RESERVATION.get(s.partition, "none"),
+               lambda t: "" if t.lower() == "none" else t)
+
+
+def ensure_partition_access(s):
+    """Before the job script is written, make sure this account can use the chosen partition and reservation.
+
+    Not every account may use every partition (the H100 nodes need a reservation that only some users are on).
+    """
+    if s.mode == "run" or shutil.which("sbatch") is None:
+        return
+    while True:
+        result = check_submission(s.partition, s.reservation, s.gpus, s.time_limit)
+        if result.ok is True:
+            return
+        if result.ok is None:
+            note(f"Could not check whether you may use the partition {s.partition}: {result.reason}.")
+            return
+        with_res = f" with the reservation {s.reservation}" if s.reservation else ""
+        fail(f"You cannot submit to the partition {s.partition}{with_res}: {result.reason}.")
+        usual = PARTITION_RESERVATION.get(s.partition, "")
+        if usual != s.reservation and check_submission(s.partition, usual, s.gpus, s.time_limit).ok is True:
+            say(f"  The partition {s.partition} works for you with {'the reservation ' + usual if usual else 'no reservation'}.")
+        others = usable_gpu_partitions(s, exclude=(s.partition,))
+        if others:
+            say(f"  You can use: {', '.join(others)}.")
+        if ask_yes_no("Use it anyway (the job will be refused when it is submitted)?", False):
+            warn(f"Slurm will refuse jobs for the partition {s.partition}{with_res}: {result.reason}.")
+            return
+        s.partition = ask("Partition", others[0] if others else DEFAULT_PARTITION)
+        s.reservation = ask_reservation(s)
 
 
 def build_problem(s):
@@ -1409,8 +1517,7 @@ def step_run_mode(s):
     s.pixi_dir = os.path.dirname(pixi) if pixi else ""
     if ask_yes_no("Change partition, GPUs, modules or pixi location?", False):
         s.partition = ask("Partition", s.partition)
-        s.reservation = ask("Reservation (type none for no reservation)", PARTITION_RESERVATION.get(s.partition, "none"),
-                            lambda t: "" if t.lower() == "none" else t)
+        s.reservation = ask_reservation(s)
         s.gpus = ask_number("Number of GPUs", s.gpus, int, 1)
         s.modules = ask("Modules to load (comma-separated; GCC must come first)", s.modules)
         s.pixi_dir = ask("Folder containing the pixi program", s.pixi_dir or os.path.expanduser("~/.local/bin"))
@@ -1418,6 +1525,7 @@ def step_run_mode(s):
             s.adg_path = ""
     elif not s.pixi_dir:
         s.pixi_dir = ask("Folder containing the pixi program", os.path.expanduser("~/.local/bin"))
+    ensure_partition_access(s)
     problem = build_problem(s)
     if problem:
         warn(problem, record=False)
@@ -1515,6 +1623,9 @@ def submit(s):
     result = subprocess.run(["sbatch", s.script_path])  # inherits the terminal: sbatch may ask questions
     if result.returncode != 0:
         fail("sbatch reported an error, so the job was not submitted.")
+        why = check_submission(s.partition, s.reservation, s.gpus, s.time_limit)
+        if why.ok is False:
+            say(f"  Reason: {why.reason}. Run the assistant again and choose a partition you can use.")
         return None
     job_id = latest_job_id(s.jobname)
     if job_id is None:

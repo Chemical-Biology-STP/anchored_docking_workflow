@@ -52,3 +52,12 @@ def fake_pdb2pqr(monkeypatch):
     fake = FakePdb2pqr()
     monkeypatch.setattr(pp, "run_pdb2pqr", fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def scheduler_allows_everything(monkeypatch):
+    """The wizard asks Slurm whether the account may use a partition; tests must not depend on who runs them.
+    Tests of that check itself call dock_cli.check_submission through the original function they imported."""
+    import dock_cli
+
+    monkeypatch.setattr(dock_cli, "check_submission", lambda *args, **kwargs: dock_cli.SubmitCheck(True))

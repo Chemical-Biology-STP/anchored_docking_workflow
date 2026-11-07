@@ -20,6 +20,8 @@ from rdkit.Chem import AllChem
 import anchored_docking as ad
 import dock_cli as d
 
+REAL_CHECK_SUBMISSION = d.check_submission   # the autouse fixture replaces the module attribute
+
 RDLogger.DisableLog("rdApp.*")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -764,6 +766,167 @@ def custom_build(tmp_path, targets):
     if targets is not None:
         (folder / "targets").write_text(targets)
     return folder
+
+
+# --------------------------------------------------------------------------
+# Not every account may use every partition
+# --------------------------------------------------------------------------
+
+SLURM_TEXT = {      # replies seen from sbatch --test-only on the cluster
+    "access denied": "allocation failure: Access denied to requested reservation",
+    "bad reservation": "allocation failure: Requested reservation is invalid",
+    "bad partition": "sbatch: error: invalid partition specified: nosuchpart\nallocation failure: Invalid partition name specified",
+    "reservation needed": "allocation failure: Requested node configuration is not available",
+    "account": "sbatch: error: Batch job submission failed: Invalid account or account/partition combination specified",
+    "time": "allocation failure: Requested time limit is invalid (missing or exceeds some limit)",
+    "other": "sbatch: error: Something odd happened\nsecond line",
+}
+
+
+@pytest.mark.parametrize("key, partition, reservation, expected", [
+    ("access denied", "gh100", "h100", "not allowed to use the reservation h100"),
+    ("bad reservation", "ga100", "typo", "reservation typo does not exist"),
+    ("bad partition", "nosuchpart", "", "partition nosuchpart does not exist"),
+    ("reservation needed", "gh100", "", "can only be used with the reservation h100"),
+    ("reservation needed", "ga100", "", "no node of the partition ga100 has the requested GPUs"),
+    ("account", "ga100", "", "account cannot use the partition ga100"),
+    ("time", "ga100", "", "time limit is longer"),
+    ("other", "ga100", "", "Something odd happened"),
+])
+def test_slurm_refusals_are_explained_in_plain_words(key, partition, reservation, expected):
+    assert expected in d.explain_submit_error(SLURM_TEXT[key], partition, reservation)
+
+
+def fake_sbatch(tmp_path, monkeypatch, body, record=True):
+    script = tmp_path / "sbatch"
+    script.write_text("#!/bin/bash\n" + (f'echo "$@" > {tmp_path / "args.txt"}\n' if record else "") + body)
+    script.chmod(0o755)
+    monkeypatch.setattr(d.shutil, "which", lambda name: str(script) if name == "sbatch" else shutil.which(name))
+    return tmp_path / "args.txt"
+
+
+def test_an_accepted_job_means_access(tmp_path, monkeypatch):
+    args = fake_sbatch(tmp_path, monkeypatch, "echo 'sbatch: Job 1 to start at soon'\nexit 0\n")
+    result = REAL_CHECK_SUBMISSION("gh100", "h100", gpus=2, time_limit="1:00:00")
+    assert result.ok is True
+    sent = args.read_text()
+    assert "--test-only" in sent and "--partition=gh100" in sent and "--reservation=h100" in sent
+    assert "--gres=gpu:2" in sent and "--time=1:00:00" in sent       # nothing is queued, and the real request is tested
+
+
+def test_no_reservation_is_sent_when_none_is_chosen(tmp_path, monkeypatch):
+    args = fake_sbatch(tmp_path, monkeypatch, "exit 0\n")
+    REAL_CHECK_SUBMISSION("ga100")
+    assert "--reservation" not in args.read_text()
+
+
+def test_a_refusal_means_no_access_and_says_why(tmp_path, monkeypatch):
+    fake_sbatch(tmp_path, monkeypatch, "echo 'allocation failure: Access denied to requested reservation' >&2\nexit 1\n")
+    result = REAL_CHECK_SUBMISSION("gh100", "h100")
+    assert result.ok is False and "not allowed to use the reservation h100" in result.reason
+
+
+@pytest.mark.parametrize("message", ["sbatch: error: Unable to contact slurm controller (connect failure)",
+                                     "slurm_load_jobs error: Socket timed out on send/recv operation"])
+def test_an_unreachable_scheduler_is_not_mistaken_for_no_access(tmp_path, monkeypatch, message):
+    fake_sbatch(tmp_path, monkeypatch, f"echo '{message}' >&2\nexit 1\n")
+    result = REAL_CHECK_SUBMISSION("gh100", "h100")
+    assert result.ok is None and "could not be reached" in result.reason
+
+
+def test_a_scheduler_that_does_not_answer_is_not_mistaken_for_no_access(tmp_path, monkeypatch):
+    fake_sbatch(tmp_path, monkeypatch, "sleep 20\n")
+    monkeypatch.setattr(d, "SUBMIT_CHECK_SECONDS", 1)
+    assert REAL_CHECK_SUBMISSION("ga100").ok is None
+
+
+def test_a_computer_without_slurm_cannot_be_checked(monkeypatch):
+    monkeypatch.setattr(d.shutil, "which", lambda name: None)
+    assert REAL_CHECK_SUBMISSION("ga100").ok is None
+
+
+def only_allowed(*allowed):
+    """A stand-in for the scheduler that accepts only the listed partitions."""
+    def check(partition, reservation="", gpus=1, time_limit="0:10:00"):
+        if partition in allowed:
+            return d.SubmitCheck(True)
+        return d.SubmitCheck(False, f"you are not allowed to use the reservation {reservation or 'h100'}")
+    return check
+
+
+def wizard_changing_partition(monkeypatch, tmp_path, partition, then, reservation=""):
+    answers = [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "",
+               "yes", partition, reservation, "", "", ""]                   # change settings: partition, reservation, GPUs, modules, pixi
+    run_wizard(monkeypatch, answers + then)
+    return (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+
+
+def test_an_account_without_access_is_told_and_offered_a_partition_it_can_use(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "check_submission", only_allowed("ga100"))
+    script = wizard_changing_partition(monkeypatch, tmp_path, "gh100",
+                                       ["", "", "", ""])           # use it anyway: no; partition: default; reservation: none; confirm
+    text = capsys.readouterr().out
+    assert "You cannot submit to the partition gh100 with the reservation h100" in text
+    assert "You can use: ga100" in text
+    assert "#SBATCH --partition=ga100" in script and "--reservation" not in script
+
+
+def test_the_usual_reservation_is_suggested_when_another_one_is_refused(monkeypatch, tmp_path, capsys):
+    def check(partition, reservation="", gpus=1, time_limit="0:10:00"):
+        if (partition, reservation) in (("ga100", ""), ("gh100", "h100")):
+            return d.SubmitCheck(True)
+        return d.SubmitCheck(False, f"you are not allowed to use the reservation {reservation}")
+
+    monkeypatch.setattr(d, "check_submission", check)
+    wizard_changing_partition(monkeypatch, tmp_path, "gh100", ["", "", "", ""], reservation="other_res")
+    assert "The partition gh100 works for you with the reservation h100." in capsys.readouterr().out
+
+
+def test_no_such_hint_is_given_when_the_partition_is_closed_to_the_account(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "check_submission", only_allowed("ga100"))
+    wizard_changing_partition(monkeypatch, tmp_path, "gh100", ["", "", "", ""])
+    assert "works for you with" not in capsys.readouterr().out
+
+
+def test_the_user_can_insist_on_a_partition_and_is_reminded_in_the_review(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "check_submission", only_allowed("ga100"))
+    script = wizard_changing_partition(monkeypatch, tmp_path, "gh100", ["yes", ""])   # use it anyway: yes; confirm
+    assert "#SBATCH --partition=gh100" in script
+    assert any("Slurm will refuse jobs for the partition gh100" in w for w in d.WARNINGS)
+
+
+def test_a_partition_that_cannot_be_checked_is_allowed_with_a_note(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "check_submission", lambda *a, **k: d.SubmitCheck(None, "the scheduler could not be reached"))
+    script = wizard_changing_partition(monkeypatch, tmp_path, "gh100", [""])
+    assert "#SBATCH --partition=gh100" in script
+    assert "Could not check whether you may use the partition gh100" in capsys.readouterr().out
+
+
+def test_the_default_partition_is_checked_too(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d, "check_submission", only_allowed("gh100"))
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "",
+                             "no",                                 # keep the default settings (partition ga100)
+                             "", "gh100", "", ""])                 # use it anyway: no; partition; reservation (default h100); confirm
+    text = capsys.readouterr().out
+    assert "You cannot submit to the partition ga100" in text and "You can use: gh100" in text
+    assert "#SBATCH --partition=gh100" in (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+
+
+def test_nothing_is_asked_of_the_scheduler_when_running_in_the_terminal(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("the scheduler must not be asked")
+
+    monkeypatch.setattr(d, "check_submission", refuse)
+    d.ensure_partition_access(d.Settings(mode="run"))
+
+
+def test_a_refused_submission_names_the_reason(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(d.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1))
+    monkeypatch.setattr(d, "check_submission", only_allowed("ga100"))
+    result = d.submit(make_settings(tmp_path, partition="gh100", reservation="h100"))
+    text = capsys.readouterr().out
+    assert result is None and "sbatch reported an error" in text
+    assert "Reason: you are not allowed to use the reservation h100" in text
 
 
 def test_a_reservation_is_written_to_the_job_script_only_when_set(tmp_path):

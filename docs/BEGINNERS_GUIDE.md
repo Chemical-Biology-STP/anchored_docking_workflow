@@ -361,7 +361,7 @@ For cluster jobs you are also asked for:
 
 - **Job name:** anything recognisable.
 - **Time limit:** the suggestion allows 10 minutes per ligand (at least 30 minutes). The example ligand needed about 2 minutes, but bigger proteins and ligands take longer. If the time runs out, the job is stopped, so raise it for large jobs.
-- **Change partition, GPUs, modules or pixi location?** Say `no`. The defaults are the GPU partition `ga100`, 1 GPU (for the H100 nodes enter partition `gh100`; the assistant then suggests the reservation `h100`, which that partition requires), modules `GCC/13.2.0` and `AutoDock-GPU/1.5.3-CUDA` (both are required: AutoDock-GPU only works with GCC 13.2), and the pixi folder found automatically.
+- **Change partition, GPUs, modules or pixi location?** Say `no`. The defaults are the GPU partition `ga100`, 1 GPU (for the H100 nodes enter partition `gh100`; the assistant then suggests the reservation `h100`, which that partition requires and which only some accounts may use. The assistant asks the cluster whether your account can use the partition you chose, before it writes the job script, and tells you if you cannot), modules `GCC/13.2.0` and `AutoDock-GPU/1.5.3-CUDA` (both are required: AutoDock-GPU only works with GCC 13.2), and the pixi folder found automatically.
 
 ### Step 6: review
 
@@ -536,6 +536,8 @@ Most problems with input files are caught by the assistant before anything is su
 | `Not enough anchor points found.` | The shared core of a ligand has fewer usable anchor atoms than you asked for. Lower the number of anchors. The assistant normally prevents this by suggesting a safe number. |
 | `Failed to load molecule files`, or an error mentioning `NoneType` | RDKit could not read a molecule in one of the SDF files. Open the file in a chemistry program, find the problem molecule and fix or remove it. |
 | `File not found` | A typo in the path, or you are not in the `anchored_docking_workflow` folder. Check with `pwd` and `ls`. |
+| `You cannot submit to the partition ... : you are not allowed to use the reservation ...` | Your account cannot use that partition or reservation (the H100 nodes need the reservation `h100`, which only some users are on). Choose one of the partitions the assistant lists, usually `ga100`, or ask the cluster administrators for access. The AutoDock-GPU build for large cores works on `ga100` too. |
+| `Could not check whether you may use the partition` | The cluster scheduler did not answer. The assistant carries on; if the job is refused later, the reason is printed. |
 | Job stays `PD` for a long time | The GPU partition is busy. Wait, or ask for less time (shorter jobs are often scheduled sooner). |
 | Job disappeared and there are only some output folders | The time limit ran out. Increase the time limit and rerun (or put the remaining ligands in a new SDF file). |
 | Docked ligand is far from the template | The template and receptor are not in the same coordinate system. Re-export both from the **same** structure (see [5.2](#52-the-template-ligand-templatesdf)). |
