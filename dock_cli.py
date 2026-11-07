@@ -1489,6 +1489,24 @@ def expert_options(s):
     s.verbose = ask_yes_no("Print extra debug information?", False)
 
 
+def autodock_gpu_text(s):
+    """Which AutoDock-GPU the job will use, in words."""
+    if s.adg_path:
+        return f"custom build in {s.adg_path} ({atom_type_limit(s)} atom types)"
+    return f"cluster module ({MAX_ATOM_TYPES} atom types)"
+
+
+def cluster_settings_rows(s):
+    """The settings that the 'change partition, GPUs, modules or pixi location' question is about, as they stand."""
+    modules = ", ".join(m.strip() for m in s.modules.split(",") if m.strip()) or "none"
+    return [("Partition", s.partition),
+            ("Reservation", s.reservation or "none"),
+            ("GPUs", s.gpus),
+            ("Modules", modules),
+            ("pixi folder", s.pixi_dir or "not found on PATH (you will be asked for it)"),
+            ("AutoDock-GPU", autodock_gpu_text(s))]
+
+
 def step_run_mode(s):
     heading(5, "How to run it")
     has_slurm = shutil.which("sbatch") is not None
@@ -1564,6 +1582,8 @@ def step_run_mode(s):
     s.time_limit = ask("Time limit (hours:minutes:seconds)", s.time_limit, time_validator)
     pixi = shutil.which("pixi")
     s.pixi_dir = os.path.dirname(pixi) if pixi else ""
+    say("\n  The job will use these cluster settings:")
+    table(cluster_settings_rows(s), indent="    ")
     if ask_yes_no("Change partition, GPUs, modules or pixi location?", False):
         s.partition = ask("Partition", s.partition)
         s.reservation = ask_reservation(s)
@@ -1617,8 +1637,7 @@ def step_review(s):
             ("Output folder", s.outdir + output_note(s))]
     if s.seed is not None:
         rows.append(("Random seed", s.seed))
-    rows.append(("AutoDock-GPU", f"custom build in {s.adg_path} ({atom_type_limit(s)} atom types)" if s.adg_path
-                 else f"cluster module ({MAX_ATOM_TYPES} atom types)"))
+    rows.append(("AutoDock-GPU", autodock_gpu_text(s)))
     if s.protonated is not None:
         rows.append(("Protonation", f"PDB2PQR + PROPKA at pH {s.protonated.ph:g} ({s.protonated.hydrogens} hydrogens)"))
     elif s.add_hydrogens:

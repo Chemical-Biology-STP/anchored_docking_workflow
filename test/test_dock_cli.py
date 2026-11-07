@@ -929,6 +929,66 @@ def test_a_refused_submission_names_the_reason(monkeypatch, tmp_path, capsys):
     assert "Reason: you are not allowed to use the reservation h100" in text
 
 
+def test_the_current_cluster_settings_are_listed_as_they_stand(tmp_path):
+    s = make_settings(tmp_path, partition="gh100", reservation="h100", gpus=2, modules="GCC/13.2.0, Foo/1.0",
+                      pixi_dir="/opt/bin")
+    assert d.cluster_settings_rows(s) == [
+        ("Partition", "gh100"), ("Reservation", "h100"), ("GPUs", 2), ("Modules", "GCC/13.2.0, Foo/1.0"),
+        ("pixi folder", "/opt/bin"), ("AutoDock-GPU", "cluster module (32 atom types)")]
+
+
+def test_missing_values_are_described_not_left_blank(tmp_path):
+    rows = dict(d.cluster_settings_rows(make_settings(tmp_path, reservation="", pixi_dir="", modules=" , ")))
+    assert rows["Reservation"] == "none" and rows["Modules"] == "none"
+    assert "not found" in rows["pixi folder"] and "asked" in rows["pixi folder"]
+
+
+def test_a_custom_autodock_gpu_is_named_with_its_limit(tmp_path):
+    folder = custom_build(tmp_path, "80 90")
+    rows = dict(d.cluster_settings_rows(make_settings(tmp_path, adg_path=str(folder))))
+    assert rows["AutoDock-GPU"] == f"custom build in {folder} (64 atom types)"
+
+
+def test_the_review_and_the_settings_list_describe_the_autodock_gpu_alike(tmp_path):
+    s = make_settings(tmp_path, adg_path=str(custom_build(tmp_path, "80 90")))
+    assert d.autodock_gpu_text(s) == dict(d.cluster_settings_rows(s))["AutoDock-GPU"]
+
+
+def test_the_review_screen_names_the_autodock_gpu_with_the_same_words(monkeypatch, tmp_path, capsys):
+    folder = custom_build(tmp_path, "80 90")
+    s = make_settings(tmp_path, adg_path=str(folder), mode="save", kept=[], all_count=0)
+    monkeypatch.setattr(d, "ask_yes_no", lambda *a, **k: False)
+    d.step_review(s)
+    assert f"custom build in {folder} (64 atom types)" in capsys.readouterr().out
+
+
+def test_the_wizard_shows_the_current_settings_before_asking_whether_to_change_them(monkeypatch, tmp_path, capsys):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "", "no", ""])
+    text = capsys.readouterr().out
+    assert "The job will use these cluster settings:" in text
+    block = text.split("The job will use these cluster settings:")[1].split("Step 6 of 6")[0]
+    for label, value in (("Partition", d.DEFAULT_PARTITION), ("Reservation", "none"), ("GPUs", "1"),
+                         ("Modules", "GCC/13.2.0, AutoDock-GPU/1.5.3-CUDA"), ("AutoDock-GPU", "cluster module")):
+        assert any(line.split()[:1] == label.split()[:1] and value in line for line in block.splitlines()), label
+    assert text.index("Cluster job settings") < text.index("The job will use these cluster settings:")   # after job name/time
+
+
+def test_the_listed_values_are_the_ones_the_job_uses_when_nothing_is_changed(monkeypatch, tmp_path, capsys):
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", save_choice(), str(tmp_path / "o"), "", "", "no", ""])
+    script = (tmp_path / "submit_dock_CAT-13f.sh").read_text()
+    assert f"#SBATCH --partition={d.DEFAULT_PARTITION}" in script and "#SBATCH --gres=gpu:1" in script
+    assert "module load GCC/13.2.0" in script and "module load AutoDock-GPU/1.5.3-CUDA" in script
+
+
+def test_a_run_in_the_terminal_has_no_cluster_settings_to_show(monkeypatch, tmp_path, capsys):
+    run_choice = "2" if shutil.which("sbatch") else "1"                  # the menu number of "run now in this terminal"
+    run_wizard(monkeypatch, [RECEPTOR, TEMPLATE, LIGAND, "", "", run_choice, str(tmp_path / "o"),
+                             "no"])                                      # decline at the review: nothing is run
+    text = capsys.readouterr().out
+    assert "Run now in this terminal" in text and "Cancelled. Nothing was run." in text
+    assert "cluster settings" not in text and "Cluster job settings" not in text
+
+
 def test_a_reservation_is_written_to_the_job_script_only_when_set(tmp_path):
     with_reservation = d.build_script(make_settings(tmp_path, partition="gh100", reservation="h100"))
     assert "#SBATCH --partition=gh100\n#SBATCH --reservation=h100\n" in with_reservation
