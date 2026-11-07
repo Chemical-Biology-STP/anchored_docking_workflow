@@ -8,6 +8,10 @@ Based on the [AutoDock-GPU Anchored Docking Guide](https://github.com/ccsb-scrip
 
 New to the command line? Follow the step-by-step [Beginner's Guide](docs/BEGINNERS_GUIDE.md).
 
+> **Using the lab's Drug Discovery Suite?** Then there is nothing to install or clone: run `ddsuite dock` from the
+> folder with your files (see the suite's README for the one-time `ddsuite setup`). The installation steps and
+> `pixi run dock` commands in this README and in the Beginner's Guide are for using this repository on its own.
+
 ## Prerequisites
 
 1. [Pixi](https://pixi.sh/) (0.83.0 or newer) — installs RDKit, Meeko, AutoGrid and ADFRsuite

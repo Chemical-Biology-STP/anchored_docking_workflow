@@ -25,6 +25,11 @@ from dataclasses import dataclass, field
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_DIR)
 
+# The lab's launcher (ddsuite) sets DDSUITE_RUN_COMMAND, e.g. "ddsuite dock". It is used in messages that tell the
+# user how to start this tool; on its own the tool is started with `pixi run dock`.
+UNDER_DDSUITE = bool(os.environ.get("DDSUITE_RUN_COMMAND"))
+RUN_COMMAND = os.environ.get("DDSUITE_RUN_COMMAND") or "pixi run dock"
+
 DEFAULT_MODULES = "GCC/13.2.0,AutoDock-GPU/1.5.3-CUDA"
 DEFAULT_PARTITION = "ga100"
 # CUDA compute capability of the GPUs behind each known partition; a custom AutoDock-GPU build only runs on
@@ -1823,7 +1828,7 @@ def show_results(s, job_id=None):
         say(f"\n  {_c('31', str(len(failed)) + ' ligand(s) failed.')} The other ligands were still docked:")
         for r in failed[:10]:
             say(f"    folder {r['index']} ({r['name'][:30]}): {r['note']}")
-        say("  Details are in error.txt inside each failed folder. After fixing the cause, run `pixi run dock` "
+        say(f"  Details are in error.txt inside each failed folder. After fixing the cause, run `{RUN_COMMAND}` "
             "again with the same folder and answer yes to resume, to redo only the failed ligands.")
     if done:
         say(f"\n  Files in {s.outdir}:")
@@ -1883,18 +1888,22 @@ def check_environment():
         import scipy  # noqa: F401
     except ImportError:
         print("This tool must be started through pixi so that RDKit and Meeko are available:\n\n"
-              "    pixi run dock\n")
+              f"    {RUN_COMMAND}\n")
         sys.exit(1)
     if not adfr_ready():
-        print("ADFRsuite, which prepares the receptor, is not installed yet. Install everything once with:\n\n"
-              "    pixi install --all\n\n"
-              "then start this tool again with `pixi run dock`.")
+        if UNDER_DDSUITE:
+            print("ADFRsuite, which prepares the receptor, is not installed in this copy of the tool. "
+                  "Ask the maintainer of the suite to reinstall it.")
+        else:
+            print("ADFRsuite, which prepares the receptor, is not installed yet. Install everything once with:\n\n"
+                  "    pixi install --all\n\n"
+                  f"then start this tool again with `{RUN_COMMAND}`.")
         sys.exit(1)
 
 
 def main():
     argparse.ArgumentParser(
-        description="Interactive anchored docking. Run it with `pixi run dock` and answer the questions."
+        description=f"Interactive anchored docking. Run it with `{RUN_COMMAND}` and answer the questions."
     ).parse_args()
     check_environment()
 

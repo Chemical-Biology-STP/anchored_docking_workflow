@@ -188,7 +188,8 @@ def run_pdb2pqr(pdb_text, ph):
         except subprocess.TimeoutExpired:
             raise ProteinPrepError(f"PDB2PQR did not finish within {TIMEOUT_SECONDS // 60} minutes.")
         except OSError as exc:
-            raise ProteinPrepError(f"PDB2PQR could not be started ({exc}). Run through `pixi run dock`.")
+            run_command = os.environ.get("DDSUITE_RUN_COMMAND") or "pixi run dock"
+            raise ProteinPrepError(f"PDB2PQR could not be started ({exc}). Run through `{run_command}`.")
         log = result.stdout + result.stderr
         log_file = os.path.join(folder, "out.log")
         if os.path.isfile(log_file):
