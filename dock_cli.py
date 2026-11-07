@@ -42,6 +42,9 @@ TOTAL_STEPS = 6
 # Limits compiled into the AutoDock-GPU 1.5.3 build of the cluster module (common/defines.h).
 MAX_ATOM_TYPES = 32        # MAX_NUM_OF_ATYPES; scripts/build_autodock_gpu.sh makes a build with a higher value
 CUSTOM_BUILD_GLOB = "adgpu_atypes*"   # folders in <repo>/bin written by that script
+# Where the group's shared AutoDock-GPU installations live; a build with a higher atom-type limit installed
+# there (module AutoDock-GPU/1.5.3-CUDA-atypes64) is found as <root>/<version>/bin.
+SHARED_BUILD_ROOT = "/nemo/stp/chemicalbiology/home/shared/easybuild/software/AutoDock-GPU"
 MAX_GRID_POINTS = 256      # MAX_NUM_GRIDPOINTS
 # Largest box (Angstrom) for which grid_points() stays within MAX_GRID_POINTS.
 MAX_BOX_SIZE = 95.0
@@ -246,12 +249,16 @@ def grid_points(size):
 def find_custom_build():
     """The AutoDock-GPU build with the highest atom-type limit made by scripts/build_autodock_gpu.sh, or None.
 
+    Looks in the group's shared software folder (a cluster module) and in <repo>/bin.
+
     Returns (folder, limit).
     """
     import anchored_docking as ad
 
     best = None
-    for folder in glob.glob(os.path.join(REPO_DIR, "bin", CUSTOM_BUILD_GLOB)):
+    folders = sorted(glob.glob(os.path.join(SHARED_BUILD_ROOT, "*", "bin"))) \
+        + sorted(glob.glob(os.path.join(REPO_DIR, "bin", CUSTOM_BUILD_GLOB)))   # the shared one wins a tie
+    for folder in folders:
         binary = next((os.path.join(folder, n) for n in ad.ADGPU_BINARY_NAMES
                        if os.path.isfile(os.path.join(folder, n)) and os.access(os.path.join(folder, n), os.X_OK)), None)
         if binary is None:

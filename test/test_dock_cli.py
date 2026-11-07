@@ -280,7 +280,25 @@ def test_the_atom_type_limit_is_the_stock_one_unless_a_custom_build_is_used(tmp_
     assert d.atom_type_limit(d.Settings(adg_path=str(tmp_path / "nothing"))) == 32
 
 
+def test_a_build_installed_for_the_group_is_found_and_preferred_on_a_tie(tmp_path, monkeypatch):
+    shared, repo = tmp_path / "shared", tmp_path / "repo"
+    monkeypatch.setattr(d, "SHARED_BUILD_ROOT", str(shared))
+    monkeypatch.setattr(d, "REPO_DIR", str(repo))
+    assert d.find_custom_build() is None
+    for folder, limit in ((shared / "1.5.3-CUDA" / "bin", None),             # the stock module: not a custom build
+                          (shared / "1.5.3-CUDA-atypes64" / "bin", 64),
+                          (repo / "bin" / "adgpu_atypes64", 64)):
+        folder.mkdir(parents=True)
+        binary = folder / "autodock_gpu_128wi"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        if limit:
+            (folder / "max_atom_types").write_text(str(limit))
+    assert d.find_custom_build() == (str(shared / "1.5.3-CUDA-atypes64" / "bin"), 64)
+
+
 def test_a_custom_build_is_found_in_the_bin_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "SHARED_BUILD_ROOT", str(tmp_path / "no_shared_builds_here"))
     monkeypatch.setattr(d, "REPO_DIR", str(tmp_path))
     assert d.find_custom_build() is None
     for name, limit in (("adgpu_atypes48", 48), ("adgpu_atypes96", 96), ("adgpu_atypes_broken", 99)):

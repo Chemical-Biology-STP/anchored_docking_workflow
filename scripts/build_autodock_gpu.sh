@@ -84,6 +84,7 @@ if [ ! -x "$BINARY" ]; then
 fi
 mkdir -p "$OUTPUT"
 cp "$BINARY" "$OUTPUT/"
+[ -x "$BUILD/bin/adgpu_analysis" ] && cp "$BUILD/bin/adgpu_analysis" "$OUTPUT/"   # the result analysis tool
 echo "$MAX_TYPES" > "$OUTPUT/max_atom_types"
 echo "$TARGETS" > "$OUTPUT/targets"
 echo "Built $OUTPUT/autodock_gpu_${NUMWI}wi with a limit of $MAX_TYPES atom types for compute capability $TARGETS."
