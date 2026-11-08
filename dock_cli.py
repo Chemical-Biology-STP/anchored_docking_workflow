@@ -855,7 +855,20 @@ def multiline_command(prefix, args):
     return " \\\n".join(lines)
 
 
+MAIL_DOMAIN = "crick.ac.uk"
+
+
+def mail_address():
+    """Where SLURM sends the notification: the current user name plus the lab's mail domain (None if unknown)."""
+    try:
+        user = getpass.getuser()
+    except Exception:
+        return None
+    return f"{user}@{MAIL_DOMAIN}" if re.fullmatch(r"[A-Za-z0-9._-]+", user) else None
+
+
 def build_script(s):
+    mail = mail_address()
     lines = ["#!/bin/bash",
              f"#SBATCH --partition={s.partition}",
              *([f"#SBATCH --reservation={s.reservation}"] if s.reservation else []),
@@ -863,6 +876,7 @@ def build_script(s):
              f"#SBATCH --job-name={s.jobname}",
              f"#SBATCH --output={os.path.join(jobdir(s), s.jobname)}_%j.log",
              f"#SBATCH --time={s.time_limit}",
+             *(["#SBATCH --mail-type=END,FAIL", f"#SBATCH --mail-user={mail}"] if mail else []),
              ""]
     for module in s.modules.split(","):
         if module.strip():
@@ -1783,6 +1797,8 @@ def show_follow_up(job_id, s):
     say(f"    squeue -u {getpass.getuser()}            show your queued and running jobs")
     say(f"    tail -f {log}   follow the job's log (Ctrl+C to stop)")
     say(f"    scancel {job_id}                         cancel the job")
+    if mail_address():
+        say(f"\n  An email goes to {mail_address()} when the job ends or fails.")
 
 
 def result_rows(s):
