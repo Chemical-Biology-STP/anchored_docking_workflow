@@ -813,6 +813,9 @@ class Settings:
     template_mol: object = None
     extent: float = 0.0
     anchor_limit: int = 0
+    receptor_hydrogens: int = -1     # hydrogens the receptor had before any preparation (-1: not looked at)
+    flagged_choice: object = None    # "exclude" or "include" when some ligands were flagged (what was decided)
+    kept_labels: list = field(default_factory=list)   # labels of the ions and cofactors kept from a complex
 
 
 def jobdir(s):
@@ -997,6 +1000,31 @@ def stage_receptor(s, text):
         fh.write(text)
 
 
+def apply_protonation(s, prep):
+    """Use the protonated receptor from PDB2PQR for the rest of the run, and report what it did."""
+    import protein_prep as pp
+
+    s.protonated = prep
+    s.original_receptor = s.receptor
+    stage_receptor(s, prep.pdb)
+    if s.prepared is not None:
+        s.prepared.receptor_pdb = prep.pdb
+    for line in prep.lines():
+        ok(line)
+    notable = [p for p in prep.pocket if p.notable]
+    if notable:
+        say(f"\n  Residues within {pp.POCKET_DISTANCE:g} A of the template that deserve a look:")
+        table([(p.label, f"{p.pka:.1f}", p.state) for p in notable], headers=("Residue", "pKa", "State"))
+    elif prep.pocket:
+        note(f"The {len(prep.pocket)} titratable residue(s) near the template all keep their usual state.")
+    for problem in prep.problems:
+        warn(f"PDB2PQR: {problem}.")
+    if prep.kept_without_hydrogens:
+        warn(f"{', '.join(prep.kept_without_hydrogens)} kept in the receptor got no hydrogens (PDB2PQR only "
+             "protonates protein).")
+    note("The full record is saved with the results as <job name>_protonation_report.txt.")
+
+
 def step_protein(s, info, template_mol):
     """Protein preparation: report gaps and missing atoms, then protonate at a chosen pH if there are no hydrogens."""
     import numpy as np
@@ -1035,25 +1063,7 @@ def step_protein(s, info, template_mol):
             note("Falling back to ADFR's quicker rule-based hydrogen placement.")
             offer_hydrogens(s, info)
             return
-        s.protonated = prep
-        s.original_receptor = s.receptor
-        stage_receptor(s, prep.pdb)
-        if s.prepared is not None:
-            s.prepared.receptor_pdb = prep.pdb
-        for line in prep.lines():
-            ok(line)
-        notable = [p for p in prep.pocket if p.notable]
-        if notable:
-            say(f"\n  Residues within {pp.POCKET_DISTANCE:g} A of the template that deserve a look:")
-            table([(p.label, f"{p.pka:.1f}", p.state) for p in notable], headers=("Residue", "pKa", "State"))
-        elif prep.pocket:
-            note(f"The {len(prep.pocket)} titratable residue(s) near the template all keep their usual state.")
-        for problem in prep.problems:
-            warn(f"PDB2PQR: {problem}.")
-        if prep.kept_without_hydrogens:
-            warn(f"{', '.join(prep.kept_without_hydrogens)} kept in the receptor got no hydrogens (PDB2PQR only "
-                 "protonates protein).")
-        note("The full record is saved with the results as <job name>_protonation_report.txt.")
+        apply_protonation(s, prep)
     else:
         offer_hydrogens(s, info)
 
@@ -1255,6 +1265,7 @@ def prepare_from_complex(s):
         warn(f"Kept in the receptor: {', '.join(h.label for h in keep)}. Ions and cofactors may lack AutoDock "
              "partial charges (ADFR reports this for metals such as zinc), which weakens their effect.")
     stage_files(s, prepared)
+    s.kept_labels = [h.label for h in keep]
     return inv, template
 
 
@@ -1287,6 +1298,7 @@ def step_files(s):
             if report_receptor(info, hydrogens_fixable=True):
                 break
     receptor_coords = info["coords"]
+    s.receptor_hydrogens = info["hydrogens"]
 
     heading(2, "Template ligand")
     mark = len(WARNINGS)
@@ -1333,9 +1345,11 @@ def step_files(s):
         say("")
         if remaining and ask_yes_no(f"Leave out the {len(flagged)} flagged ligand(s) and dock the other {len(remaining)}?", True):
             s.kept = remaining
+            s.flagged_choice = "exclude"
             say(f"  {len(remaining)} ligand(s) will be docked.")
         else:
             s.kept = results
+            s.flagged_choice = "include"
             warn("Flagged ligands are included. Ones that cannot be docked are reported as failed; "
                  "the other ligands are still docked.")
     s.remaining = len(s.kept)
@@ -1635,7 +1649,7 @@ def anchors_text(s):
     return f"{s.anchor_num} ({s.anchor_mode})"
 
 
-def step_review(s):
+def step_review(s, confirm=True):
     heading(6, "Review")
     problem = build_problem(s)
     if problem:
@@ -1679,6 +1693,8 @@ def step_review(s):
         for w in dict.fromkeys(WARNINGS):
             say(f"   - {w}")
     say("")
+    if not confirm:
+        return True
     return ask_yes_no(f"{action}?", True)
 
 
@@ -1865,7 +1881,7 @@ def show_results(s, job_id=None):
                     say("    " + line.rstrip())
 
 
-def run_here(s):
+def run_here(s, interactive=True):
     sys.path.insert(0, REPO_DIR)
     import anchored_docking as ad
 
@@ -1876,7 +1892,7 @@ def run_here(s):
         return None
     if shutil.which("nvidia-smi") is None or subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode != 0:
         warn("No GPU is visible on this machine; AutoDock-GPU will fail here.")
-        if not ask_yes_no("Run anyway?", False):
+        if not interactive or not ask_yes_no("Run anyway?", False):
             return None
     finalize_structure_files(s)
     prepare_ligand_file(s)
@@ -1889,6 +1905,472 @@ def run_here(s):
         fail("Stopped.")
         return None
     return result.returncode == 0
+
+
+# --------------------------------------------------------------------------
+# Run file: `dock run.yaml` does what the wizard does, answering its questions from the file
+# --------------------------------------------------------------------------
+
+
+class Stop(Exception):
+    """The run file leaves a question open that the wizard would have asked, or asks for something impossible."""
+
+
+def _norm(label):
+    return re.sub(r"\s+", "", str(label)).upper()
+
+
+def _molecule_lines(hets, suggestion=None, defaults=False):
+    import structure_prep as sp
+
+    lines = []
+    for het in hets[:12]:
+        text = (f"    {het.label:<12} {het.kind:<9} {het.heavy:>3} heavy atoms, {het.contacts} protein contacts"
+                if not defaults else
+                f"    {het.label:<12} {het.kind:<9} {het.heavy:>3} heavy atoms, {het.distance:.1f} A from the template"
+                f" (the wizard suggests: {'keep' if sp.default_keep(het) else 'remove'})")
+        lines.append(text + ("   <- the wizard suggests this one" if het is suggestion else ""))
+    if len(hets) > 12:
+        lines.append(f"    ... and {len(hets) - 12} more")
+    return lines
+
+
+def pick_template(inv, wanted, components):
+    import structure_prep as sp
+
+    candidates = sp.template_candidates(inv)
+    if not candidates:
+        raise Stop("No molecule in the structure file is big enough to be a ligand, so there is no template "
+                   "to extract. Use 'receptor' and 'template' with files that are ready instead.")
+    suggestion = sp.suggested_template(inv)
+    listing = "\n".join(_molecule_lines(candidates, suggestion))
+    if wanted is None:
+        raise Stop("'template_molecule' is missing.\n"
+                   "  The wizard asks which molecule in the structure is the template (the one to anchor to). "
+                   "The candidates are:\n" + listing + "\n"
+                   "  Add the code, chain and number of one of them, for example:  template_molecule: "
+                   f"{(suggestion or candidates[0]).label}")
+    for het in candidates:
+        if _norm(het.label) == _norm(wanted):
+            return het
+    raise Stop(f"'template_molecule: {wanted}' is not a molecule that can be the template.\n"
+               "  The candidates are:\n" + listing)
+
+
+def pick_chains(inv, wanted, distances):
+    import structure_prep as sp
+
+    names = list(inv.protein_chains)
+    if wanted is not None:
+        unknown = [c for c in wanted if c not in inv.protein_chains]
+        if unknown or not wanted:
+            raise Stop(f"'chains' names {', '.join(unknown) or 'no chain'}, but the protein chains in the "
+                       f"structure are: {', '.join(names)}.")
+    if len(names) == 1:
+        return names
+    suggested = sp.default_chains(distances)
+    if wanted is None:
+        rows = [f"    {name:<6} {n:>5} residues, nearest to the template {distances[name]:.1f} A"
+                + ("   <- the wizard suggests keeping it" if name in suggested else "")
+                for name, n in inv.protein_chains.items()]
+        raise Stop("'chains' is missing.\n"
+                   "  The structure has several protein chains and the wizard asks which to keep:\n"
+                   + "\n".join(rows) + f"\n  Add the chains to keep, for example:  chains: [{', '.join(suggested)}]")
+    return sorted(set(wanted), key=names.index)
+
+
+def pick_kept(plan, wanted):
+    if wanted is not None:
+        asked = {_norm(h.label): h for h in plan.ask}
+        unknown = [w for w in wanted if _norm(w) not in asked]
+        if unknown:
+            options = ", ".join(h.label for h in plan.ask) or "none near the template"
+            raise Stop(f"'keep_molecules' names {', '.join(unknown)}, which is not among the molecules that could be "
+                       f"kept. Those are: {options}.")
+        return [asked[_norm(w)] for w in dict.fromkeys(wanted)]
+    if not plan.ask:
+        return []
+    raise Stop("'keep_molecules' is missing.\n"
+               "  Waters, additives and sugars are removed. The wizard asks, for each of these molecules near the "
+               "template, whether to keep it in the receptor (for example a catalytic metal or a cofactor):\n"
+               + "\n".join(_molecule_lines(plan.ask, defaults=True)) + "\n"
+               "  List the ones to keep, or none:  keep_molecules: [ZN A601]   or   keep_molecules: []")
+
+
+def headless_protein(s, cfg, info, template_mol):
+    """The protein preparation step, deciding from the run file instead of asking."""
+    import numpy as np
+
+    import protein_prep as pp
+
+    say("\n  Protein preparation")
+    with open(s.receptor, errors="replace") as fh:
+        text = fh.read()
+    template_xyz = np.array([p for p, a in zip(template_mol.GetConformer().GetPositions(), template_mol.GetAtoms())
+                             if a.GetAtomicNum() > 1])
+    notes, urgent = pp.quality_lines(pp.read_residues(text), template_xyz)
+    for line in notes:
+        note(line)
+    for line in urgent:
+        warn(line)
+    if not notes and not urgent:
+        ok("No gaps in the chains and no residues with missing heavy atoms.")
+    choice = cfg.get("protonation")
+    if info["hydrogens"] > 0:
+        ok(f"The receptor already has hydrogens ({info['hydrogens']}); they are used as they are.")
+        if choice is not None:
+            note(f"'protonation: {choice}' is ignored because the receptor already has hydrogens.")
+        return
+    if choice is None:
+        raise Stop("'protonation' is missing.\n"
+                   "  The receptor has no hydrogens and docking needs them. The wizard asks how to add them; "
+                   "choose one:\n"
+                   "    protonation: pdb2pqr    predict the charge state of each residue at a pH, place hydrogens "
+                   "(takes about a minute; set 'ph:' to change the default 7.4)\n"
+                   "    protonation: adfr       a quick rule-based guess; histidine protonation is not optimised\n"
+                   "    protonation: none       add nothing (the results will be poor)")
+    if choice == "pdb2pqr":
+        ph = cfg.get("ph", pp.DEFAULT_PH)
+        say(f"  Protonating with PDB2PQR and PROPKA at pH {ph:g}...")
+        try:
+            prep = pp.protonate(text, template_xyz, ph)
+        except pp.ProteinPrepError as exc:
+            raise Stop(f"Protonation with PDB2PQR did not work: {exc}\n"
+                       "  The wizard would fall back to ADFR's quicker hydrogen placement. To do that, set "
+                       "'protonation: adfr'.")
+        apply_protonation(s, prep)
+    elif choice == "adfr":
+        s.add_hydrogens = True
+        warn("Hydrogens will be added to the receptor by a quick guess; check histidine protonation if it matters "
+             "for your target.")
+    else:
+        warn("The receptor has no hydrogens and none will be added; the results will be poor.")
+
+
+def headless_files(s, cfg):
+    heading(1, "Protein structure")
+    if cfg["route"] == "structure":
+        import structure_prep as sp
+
+        components = sp.Components()
+        s.structure_path = cfg["structure"]
+        try:
+            structure, n_models, altlocs = sp.load_structure(s.structure_path)
+            inv = sp.inventory(structure, n_models, altlocs, s.structure_path)
+        except sp.PrepError as exc:
+            raise Stop(f"The structure file cannot be used: {exc}")
+        show_inventory(inv)
+        template = pick_template(inv, cfg.get("template_molecule"), components)
+        distances = sp.measure_distances(inv, template)
+        chains = pick_chains(inv, cfg.get("chains"), distances)
+        plan = sp.plan_molecules(inv, template, chains)
+        keep = pick_kept(plan, cfg.get("keep_molecules"))
+        say(f"\n  Looking up the chemistry of {template.name} at the PDB to give the template its hydrogens for display...")
+        try:
+            prepared = sp.prepare(structure, inv, template, chains, keep, ccd=components.fetch)
+        except sp.PrepError as exc:
+            raise Stop(f"The structure could not be prepared: {exc}")
+        say("\n  What was done with the structure:")
+        for line in prepared.summary:
+            say(f"    - {line}")
+        if keep:
+            warn(f"Kept in the receptor: {', '.join(h.label for h in keep)}. Ions and cofactors may lack AutoDock "
+                 "partial charges (ADFR reports this for metals such as zinc), which weakens their effect.")
+        stage_files(s, prepared)
+        s.kept_labels = [h.label for h in keep]
+        info = analyse_receptor(s.receptor)
+        say("")
+        report_receptor(info, hydrogens_fixable=True, check_hetero=False)
+    else:
+        s.receptor = cfg["receptor"]
+        info = analyse_receptor(s.receptor)
+        if not report_receptor(info, hydrogens_fixable=True):
+            raise Stop(f"The receptor file cannot be used: {s.receptor}")
+    s.receptor_hydrogens = info["hydrogens"]
+
+    heading(2, "Template ligand")
+    if cfg["route"] == "structure":
+        say(f"  Taken from the structure: {s.prepared.template.label}.\n")
+    else:
+        s.template = cfg["template"]
+    template_mol = load_template(s.template)
+    extent = report_template(template_mol, info["coords"], 1 if cfg["route"] == "structure" else count_molecules(s.template))
+    if extent is None:
+        raise Stop("The template cannot be used (see above).")
+    s.template_mol, s.extent = template_mol, extent
+    headless_protein(s, cfg, info, template_mol)
+
+    heading(3, "Ligands to dock")
+    s.ligands = cfg["ligands"]
+    results = check_ligands(template_mol, s.ligands)
+    report_ligands(results)
+    good = [r for r in results if r.usable]
+    if not good:
+        raise Stop("None of the ligands can be docked with this template (see above).")
+    s.all_count = len(results)
+    s.kept = good
+    flagged = flagged_ligands(results)
+    if flagged:
+        choice = cfg.get("flagged_ligands")
+        if choice is None:
+            lines = [f"    #{r.index + 1} {r.name[:40]}: " + (r.reason if not r.usable else "; ".join(r.notes))
+                     for r in flagged[:15]]
+            if len(flagged) > 15:
+                lines.append(f"    ... and {len(flagged) - 15} more")
+            raise Stop("'flagged_ligands' is missing.\n"
+                       f"  {len(flagged)} of {len(results)} ligand(s) are flagged (they cannot be docked, or are likely "
+                       "to cause trouble). The wizard asks whether to leave them out:\n" + "\n".join(lines) + "\n"
+                       "    flagged_ligands: exclude    dock only the ligands that are not flagged\n"
+                       "    flagged_ligands: include    dock all of them; ligands that cannot be docked are reported "
+                       "as failed, the others are still docked")
+        flagged_ids = {id(r) for r in flagged}
+        remaining = [r for r in results if id(r) not in flagged_ids]
+        if choice == "exclude" and remaining:
+            s.kept, s.flagged_choice = remaining, "exclude"
+            say(f"  {len(remaining)} ligand(s) will be docked ({len(flagged)} flagged ligand(s) left out).")
+        else:
+            s.kept, s.flagged_choice = results, "include"
+            warn("Flagged ligands are included. Ones that cannot be docked are reported as failed; "
+                 "the other ligands are still docked." if choice == "include" else
+                 "Every ligand is flagged, so all of them are included. Ones that cannot be docked are reported as failed.")
+    s.remaining = len(s.kept)
+    s.anchor_limit = min((r.anchors for r in s.kept if r.anchors), default=0)
+
+
+def headless_settings(s, cfg):
+    heading(4, "Docking settings")
+    settings = cfg["docking"]
+    usable = s.anchor_limit
+    measure_atom_types(s)
+    choose_autodock_gpu(s)
+    if cfg["run"].get("autodock_gpu") == "cluster" and s.adg_path:
+        s.adg_path = ""
+        note("run.autodock_gpu is 'cluster': the cluster's AutoDock-GPU is used, so a ligand that needs more atom "
+             "types gets fewer anchors.")
+    limit = atom_type_limit(s)
+    mode = settings.get("anchor_mode", "spread")
+    s.anchor_mode = mode
+    anchors = settings.get("max_anchors")
+    if mode == "spread":
+        s.anchor_num = limit if anchors is None else anchors
+        if s.anchor_num > limit:
+            raise Stop(f"docking.max_anchors is {s.anchor_num}, but AutoDock-GPU supports {limit} atom types in all. "
+                       f"Use {limit} or fewer.")
+    elif mode == "area":
+        if usable and usable < 3:
+            raise Stop(f"docking.anchor_mode 'area' needs at least 3 usable anchor atoms, but the weakest ligand has "
+                       f"{usable}. Use 'spread' or 'random'.")
+        s.anchor_num = 3
+        if anchors not in (None, 3):
+            note("docking.max_anchors is ignored: 'area' always uses 3 anchors.")
+    else:
+        s.anchor_num = min(3, usable, limit - 1) if anchors is None and usable else (3 if anchors is None else anchors)
+        if s.anchor_num > limit - 1:
+            raise Stop(f"docking.max_anchors is {s.anchor_num}, but 'random' can use at most {limit - 1} (each anchor "
+                       f"is an atom type and AutoDock-GPU supports {limit}).")
+        if usable and s.anchor_num > usable:
+            warn(f"The weakest ligand has only {usable} usable anchor atom(s); the job will fail on it.")
+    if usable and usable < 3:
+        warn(f"Only {usable} usable anchor atom(s) in the weakest ligand: the core will be held loosely there.")
+    s.size = settings.get("box_size", 20.0)
+    if s.size > MAX_BOX_SIZE:
+        raise Stop(f"docking.box_size is {s.size:g} A; the largest allowed is {MAX_BOX_SIZE:g} A.")
+    s.samples = settings.get("samples", 100)
+    s.seed = settings.get("seed")
+    s.verbose = settings.get("verbose", False)
+    if settings.get("core_smarts"):
+        try:
+            available = manual_core_anchors(settings["core_smarts"], s.template_mol)
+            s.query_smarts = settings["core_smarts"]
+            if settings.get("anchor_atoms") is not None:
+                s.anchor_indices = parse_anchor_indices(" ".join(map(str, settings["anchor_atoms"])), set(available))
+        except ValueError as exc:
+            raise Stop(f"docking.core_smarts / anchor_atoms: {exc}")
+        warn("Manual pattern: the ligand checks above used automatic core finding and may not apply.")
+    if s.size <= s.extent:
+        warn(f"The search box ({s.size:g} A) is not larger than the template ({s.extent:.1f} A at its longest). "
+             "Use a bigger box.")
+    if s.size >= LARGE_BOX_SIZE:
+        warn(f"A {s.size:g} A box is large: grid generation time and disk use grow with the cube of the size "
+             f"(about {(s.size / 20.0) ** 3:.0f}x the default 20 A box).")
+    s.clean = settings.get("clean_intermediates", len(s.kept) >= 10)
+    say(f"  {anchors_text(s).capitalize()}; search box {s.size:g} A; intermediate files "
+        f"{'deleted' if s.clean else 'kept'} (about {disk_per_ligand_mb(s.size, anchors_in_use(s)):.0f} MB per ligand "
+        "while they exist).")
+
+
+def headless_run(s, cfg):
+    heading(5, "How to run it")
+    run = cfg["run"]
+    s.mode = run["mode"]
+    if s.mode == "submit" and shutil.which("sbatch") is None:
+        raise Stop("run.mode is 'submit', but SLURM (sbatch) was not found on this computer. Use 'save' to only "
+                   "write the job script, or 'run' on a machine with a GPU.")
+    default_name = "dock_" + re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.splitext(os.path.basename(s.ligands))[0])
+    s.jobname = run.get("job_name", default_name[:40])
+
+    out = cfg["output"]
+    protected = [s.receptor, s.template, s.ligands, REPO_DIR, os.getcwd(), os.path.expanduser("~"), "/"]
+    if s.structure_path:
+        protected.append(s.structure_path)
+    problem = validate_outdir(out, protected)
+    if problem:
+        raise Stop(f"'output' {out}: {problem}")
+    s.resume, s.remaining = False, len(s.kept)
+    choice = cfg.get("existing_output")
+    if os.path.isdir(out) and os.listdir(out):
+        earlier = previous_run(s, out)
+        if choice is None:
+            if earlier is None:
+                state = "It does not hold an earlier run of this workflow."
+            elif earlier[0]:
+                state = ("It holds an earlier run, but these differ from this run file, so it cannot be resumed: "
+                         f"{', '.join(earlier[0])}.")
+            else:
+                state = (f"It holds an earlier run with the same inputs and settings: {earlier[1]} of "
+                         f"{len(s.kept)} ligand(s) are already docked.")
+            raise Stop("'existing_output' is missing.\n"
+                       f"  {out} already exists and is not empty. {state}\n"
+                       "  The wizard asks what to do about it:\n"
+                       "    existing_output: resume       skip the finished ligands and dock the rest (needs the "
+                       "same inputs and settings)\n"
+                       "    existing_output: overwrite    delete its contents and write new results there\n"
+                       "  Or choose another 'output' folder.")
+        if choice == "resume":
+            if earlier is None or earlier[0]:
+                why = ("it holds no earlier run of this workflow" if earlier is None else
+                       f"these differ from the earlier run: {', '.join(earlier[0])}")
+                raise Stop(f"'existing_output: resume' is not possible: {why}. Use 'overwrite' or another folder.")
+            s.resume, s.force, s.outdir = True, False, out
+            s.remaining = len(s.kept) - earlier[1]
+        else:
+            s.force, s.outdir = True, out
+    else:
+        s.force, s.outdir = os.path.isdir(out), out
+
+    needed = estimate_disk_mb(s.remaining, s.size, s.clean, anchors_in_use(s))
+    free = shutil.disk_usage(nearest_existing_parent(s.outdir)).free / 1e6
+    if needed > free:
+        warn(f"This run may need about {needed / 1000:.1f} GB but only {free / 1000:.1f} GB is free where the "
+             "output goes. Free up space, choose another folder, or delete intermediate files.")
+    elif needed > 0.5 * free:
+        warn(f"This run may need about {needed / 1000:.1f} GB, over half of the {free / 1000:.1f} GB free "
+             "where the output goes.")
+    if s.mode == "run":
+        return
+
+    s.time_limit = run.get("time", fmt_minutes(max(MIN_TIME_MINUTES, s.remaining * MINUTES_PER_LIGAND)))
+    s.partition = run.get("partition", s.partition)
+    s.reservation = run.get("reservation", PARTITION_RESERVATION.get(s.partition, ""))
+    s.gpus = run.get("gpus", s.gpus)
+    s.modules = run.get("modules", s.modules)
+    if "pixi_dir" in run:
+        s.pixi_dir = run["pixi_dir"]
+    else:
+        pixi = shutil.which("pixi")
+        if not pixi:
+            raise Stop("The pixi program was not found on PATH, and the job needs to know where it is. "
+                       "Add 'pixi_dir: /folder/with/pixi' to the 'run' section.")
+        s.pixi_dir = os.path.dirname(pixi)
+    say("\n  The job will use these cluster settings:")
+    table(cluster_settings_rows(s), indent="    ")
+    if shutil.which("sbatch") is not None:
+        result = check_submission(s.partition, s.reservation, s.gpus, s.time_limit)
+        if result.ok is False:
+            with_res = f" with the reservation {s.reservation}" if s.reservation else ""
+            others = usable_gpu_partitions(s, exclude=(s.partition,))
+            raise Stop(f"You cannot submit to the partition {s.partition}{with_res}: {result.reason}.\n"
+                       + (f"  You can use: {', '.join(others)}. Set 'partition' in the 'run' section.\n" if others else "")
+                       + "  The same applies to 'reservation'.")
+        if result.ok is None:
+            note(f"Could not check whether you may use the partition {s.partition}: {result.reason}.")
+    problem = build_problem(s)
+    if problem:
+        if run.get("autodock_gpu") == "cluster":
+            s.adg_path = ""
+            warn(problem + " The cluster's AutoDock-GPU is used instead (run.autodock_gpu: cluster); a ligand may "
+                           "get fewer anchors.")
+        else:
+            raise Stop(problem + "\n  Choose a partition the build was made for, or set 'autodock_gpu: cluster' in "
+                                 "the 'run' section to use the cluster's AutoDock-GPU (a ligand may then get fewer "
+                                 "anchors).")
+
+
+def run_file_values(s):
+    """The answers of this run, in the form runfile.render() writes."""
+    values = {}
+    if s.prepared is not None:
+        values.update(structure=s.structure_path, template_molecule=s.prepared.template.label,
+                      chains=list(s.prepared.kept_chains), keep_molecules=list(s.kept_labels))
+    else:
+        values.update(receptor=s.original_receptor if s.protonated is not None else s.receptor, template=s.template)
+    values.update(ligands=s.ligands, output=s.outdir)
+    if s.resume:
+        values["existing_output"] = "resume"
+    elif s.force and os.path.isdir(s.outdir) and os.listdir(s.outdir):
+        values["existing_output"] = "overwrite"
+    if s.receptor_hydrogens == 0:
+        values["protonation"] = "pdb2pqr" if s.protonated is not None else ("adfr" if s.add_hydrogens else "none")
+        if s.protonated is not None:
+            values["ph"] = s.protonated.ph
+    values["flagged_ligands"] = s.flagged_choice
+    values["docking"] = {"anchor_mode": s.anchor_mode, "max_anchors": s.anchor_num, "box_size": s.size,
+                         "samples": s.samples if s.anchor_mode == "area" else None, "seed": s.seed,
+                         "core_smarts": s.query_smarts, "anchor_atoms": s.anchor_indices,
+                         "clean_intermediates": s.clean, "verbose": True if s.verbose else None}
+    run = {"mode": s.mode, "job_name": s.jobname}
+    if s.mode != "run":
+        run.update(time=s.time_limit, partition=s.partition, reservation=s.reservation or "none", gpus=s.gpus,
+                   modules=s.modules, pixi_dir=s.pixi_dir)
+    values["run"] = run
+    return values
+
+
+def write_run_file(s):
+    """Save this run's answers next to the job script, so it can be repeated with `<command> <file>`."""
+    import runfile
+
+    path = os.path.join(jobdir(s), f"{s.jobname}_run.yaml")
+    try:
+        os.makedirs(jobdir(s), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(runfile.render(run_file_values(s), RUN_COMMAND))
+    except OSError as exc:
+        warn(f"Could not save the run file: {exc}", record=False)
+        return None
+    ok(f"Run file saved: {path}")
+    note(f"Repeat this run, or change a value and run it again, with:  {RUN_COMMAND} {path}")
+    return path
+
+
+def run_from_file(path, check_only=False):
+    import runfile
+
+    try:
+        cfg = runfile.load(path)
+    except runfile.RunFileError as exc:
+        print(f"\n{exc}\n\nNothing was run. Print an annotated example with:  {RUN_COMMAND} --example")
+        sys.exit(2)
+    s = Settings()
+    say(bold("\nAnchored docking"))
+    say(f"Run file: {cfg['file']}")
+    try:
+        headless_files(s, cfg)
+        headless_settings(s, cfg)
+        headless_run(s, cfg)
+    except Stop as exc:
+        print(f"\n{_c('31', 'Stopped.')} {exc}\n\n  Nothing was run. The run file: {cfg['file']}")
+        sys.exit(2)
+    except (KeyboardInterrupt, EOFError):
+        say("\n\nStopped. Nothing was run.")
+        sys.exit(130)
+    step_review(s, confirm=False)
+    if check_only:
+        say("\nThe run file is complete and everything checks out. Nothing was run (--check).")
+        return
+    if os.path.join(jobdir(s), f"{s.jobname}_run.yaml") != cfg["file"]:
+        write_run_file(s)   # a copy with every default filled in, next to the job script
+    execute(s, ask_watch=False, wait=cfg["run"].get("watch", False))
 
 
 # --------------------------------------------------------------------------
@@ -1917,16 +2399,59 @@ def check_environment():
         sys.exit(1)
 
 
+def execute(s, ask_watch=True, wait=False):
+    """Do what the review said: run the docking here, or write the job script and submit it."""
+    if s.mode == "run":
+        outcome = run_here(s, interactive=ask_watch)
+        if outcome is None:
+            fail("The docking did not start or was stopped. See the messages above.")
+            sys.exit(1)
+        show_results(s)  # also after failures: the other ligands may have been docked
+        if not outcome:
+            fail("Some ligands failed. See the results above.")
+            sys.exit(1)
+        return
+    write_script(s)
+    if s.mode == "save":
+        say(f"\n  Submit it later with:  sbatch {s.script_path}")
+        return
+    job_id = submit(s)
+    if job_id is None:
+        return
+    ok(f"Submitted job {job_id}.")
+    show_follow_up(job_id, s)
+    say("")
+    if (ask_yes_no("Watch the job until it finishes?", True) if ask_watch else wait):
+        if watch(job_id, s):
+            show_results(s, job_id)
+
+
 def main():
-    argparse.ArgumentParser(
-        description=f"Interactive anchored docking. Run it with `{RUN_COMMAND}` and answer the questions."
-    ).parse_args()
+    parser = argparse.ArgumentParser(
+        description=f"Interactive anchored docking. Run it with `{RUN_COMMAND}` and answer the questions, or give "
+                    f"it a run file that holds all the answers: `{RUN_COMMAND} run.yaml`.")
+    parser.add_argument("run_file", nargs="?", help="YAML file with the inputs and settings of one run")
+    parser.add_argument("--check", action="store_true",
+                        help="check the run file and show what would be done, without running anything")
+    parser.add_argument("--example", action="store_true", help="print an annotated example run file and exit")
+    args = parser.parse_args()
+    if args.example:
+        import runfile
+
+        print(runfile.EXAMPLE, end="")
+        return
+    if args.check and not args.run_file:
+        parser.error("--check needs a run file")
     check_environment()
+    if args.run_file:
+        run_from_file(args.run_file, args.check)
+        return
 
     s = Settings()
     say(bold("\nAnchored docking"))
     say("Dock a series of ligands into a protein, anchored to a template ligand.")
     say("Answer each question, or press Enter to accept the suggestion in [brackets]. Ctrl+C quits.")
+    say(f"Everything you answer is saved as a run file, so the same run can be repeated with `{RUN_COMMAND} <file>`.")
     s_submitted = False
     try:
         step_files(s)
@@ -1936,29 +2461,8 @@ def main():
             say("\nCancelled. Nothing was run.")
             return
         s_submitted = True
-        if s.mode == "run":
-            outcome = run_here(s)
-            if outcome is None:
-                fail("The docking did not start or was stopped. See the messages above.")
-                sys.exit(1)
-            show_results(s)  # also after failures: the other ligands may have been docked
-            if not outcome:
-                fail("Some ligands failed. See the results above.")
-                sys.exit(1)
-            return
-        write_script(s)
-        if s.mode == "save":
-            say(f"\n  Submit it later with:  sbatch {s.script_path}")
-            return
-        job_id = submit(s)
-        if job_id is None:
-            return
-        ok(f"Submitted job {job_id}.")
-        show_follow_up(job_id, s)
-        say("")
-        if ask_yes_no("Watch the job until it finishes?", True):
-            if watch(job_id, s):
-                show_results(s, job_id)
+        write_run_file(s)
+        execute(s)
     except (KeyboardInterrupt, EOFError):
         say("\n\nStopped." + ("" if s_submitted else " Nothing was run."))
         sys.exit(130)

@@ -20,6 +20,7 @@ numpy = ">=2.5.4,<3"
 scipy = ">=1.18.1,<2"
 pdb2pqr = ">=3.8.0,<4"
 propka = ">=3.5.1,<4"
+pyyaml = ">=6.0.3,<7"
 
 # ADFRsuite (prepare_receptor) ships its own Python 2.7 and overwrites `python`
 # in the environment's bin/, so it lives in a separate environment.

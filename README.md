@@ -9,8 +9,9 @@ Based on the [AutoDock-GPU Anchored Docking Guide](https://github.com/ccsb-scrip
 New to the command line? Follow the step-by-step [Beginner's Guide](docs/BEGINNERS_GUIDE.md).
 
 > **Using the lab's Drug Discovery Suite?** Then there is nothing to install or clone: run `ddsuite dock` from the
-> folder with your files (see the suite's README for the one-time `ddsuite setup`). The installation steps and
-> `pixi run dock` commands in this README and in the Beginner's Guide are for using this repository on its own.
+> folder with your files (see the suite's README for the one-time `ddsuite setup`), or `ddsuite dock run.yaml` with
+> a [run file](#run-file-dock-runyaml). The installation steps and `pixi run dock` commands in this README and in the
+> Beginner's Guide are for using this repository on its own.
 
 ## Prerequisites
 
@@ -243,6 +244,47 @@ It then asks how to run:
 Nothing is submitted until you confirm on the final review screen. The output folder is emptied if it already exists, so the CLI refuses a folder that contains your input files or this repository and asks before deleting a non-empty one.
 
 The CLI is a front end for `anchored_docking.py`; you can still call that script directly with the flags listed above.
+
+## Run file (`dock run.yaml`)
+
+For repeated or scripted runs, put all the inputs and settings in a YAML file instead of answering the questions:
+
+```bash
+pixi run dock run.yaml          # or: ddsuite dock run.yaml
+pixi run dock run.yaml --check  # run every check and show the review, but run nothing
+pixi run dock --example         # print an annotated example file
+```
+
+The file is checked first and every problem in it is listed together. Then the same preparation, checks and review run as in the wizard, and the job is submitted, run or saved as the file says. It asks nothing.
+
+**The wizard writes one for you.** Every wizard run saves its answers as `<job name>_run.yaml` next to the job script, so any run can be repeated, or changed and run again. Running a run file saves a copy with every default filled in in the same place.
+
+```yaml
+receptor: protein.pdb           # or:  structure: complex.pdb  (cleaned up for you, see below)
+template: template.sdf
+ligands: ligands.sdf
+output: results/run1            # paths are relative to this file
+
+docking:                        # all optional; these are the wizard's recommendations
+  anchor_mode: spread           # spread | random | area
+  box_size: 20
+
+run:
+  mode: submit                  # submit | run | save   (required)
+  time: "2:00:00"               # in quotes: YAML reads an unquoted 2:00:00 as a number
+```
+
+**Questions the file must answer.** Where the wizard would stop and ask, the run file has no default: if the data raises the question and the file does not answer it, the run stops before anything is done, says which key is missing and why, and lists the options. These keys are needed only when the question arises:
+
+| Key | When it is needed |
+|---|---|
+| `run.mode` | always: `submit`, `run` or `save` |
+| `template_molecule`, `chains`, `keep_molecules` | when starting from a `structure`: which molecule is the template (as `code chain+number`, e.g. `B7Z A401`), which protein chains to keep (if there are several), and which ions or cofactors near the template to keep (`[]` for none). The message lists the candidates. |
+| `protonation` | when the receptor has no hydrogens: `pdb2pqr` (with `ph`, default 7.4), `adfr` or `none` |
+| `flagged_ligands` | when some ligands are flagged: `exclude` or `include` |
+| `existing_output` | when the output folder is not empty: `resume` (same inputs and settings only) or `overwrite` |
+
+All other settings have the defaults of the wizard's recommended answers. The full list of keys, with comments, is printed by `--example`.
 
 ### Tests
 
